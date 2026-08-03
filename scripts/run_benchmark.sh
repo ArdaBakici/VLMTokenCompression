@@ -13,6 +13,9 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 WORKERS="${WORKERS:-4}"
 SYNC_ENV="${SYNC_ENV:-1}"
 BOOTSTRAP_CONDA="${BOOTSTRAP_CONDA:-1}"
+SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-1800}"
+SERVER_LOG_LINES="${SERVER_LOG_LINES:-200}"
+STREAM_SERVER_LOGS="${STREAM_SERVER_LOGS:-1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 if [[ "$BENCHMARK" != "mmiu" && "$BENCHMARK" != "crossvid" ]]; then
@@ -136,28 +139,54 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM INT
 
-printf 'Starting %s with tensor parallel size %s\n' "$MODEL" "$TENSOR_PARALLEL_SIZE"
-"$UV_BIN" run --no-sync vllm serve "$MODEL" \
-    --host 127.0.0.1 \
-    --port "$PORT" \
-    --dtype bfloat16 \
-    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --limit-mm-per-prompt '{"image":128}' \
-    >"$SERVER_LOG" 2>&1 &
+printf '%s\n' '--- vLLM startup configuration ---'
+printf 'Model: %s\n' "$MODEL"
+printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
+printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
+printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
+printf 'GPU memory utilization: %s\n' "$GPU_MEMORY_UTILIZATION"
+printf 'Conda environment: %s\n' "$CONDA_ENV"
+printf 'Server log: %s\n' "$SERVER_LOG"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    printf '%s\n' 'Visible GPUs:'
+    nvidia-smi --list-gpus || true
+else
+    printf '%s\n' 'Warning: nvidia-smi is not available.'
+fi
+printf '%s\n' '----------------------------------'
+
+vllm_command=(
+    "$UV_BIN" run --no-sync vllm serve "$MODEL"
+    --host 127.0.0.1
+    --port "$PORT"
+    --dtype bfloat16
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+    --max-model-len "$MAX_MODEL_LEN"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --limit-mm-per-prompt '{"image":128}'
+)
+
+printf 'Starting vLLM and waiting up to %s seconds for readiness.\n' "$SERVER_START_TIMEOUT"
+if [[ "$STREAM_SERVER_LOGS" == "1" ]]; then
+    "${vllm_command[@]}" > >(tee "$SERVER_LOG") 2>&1 &
+else
+    "${vllm_command[@]}" >"$SERVER_LOG" 2>&1 &
+fi
 SERVER_PID=$!
 
-"$UV_BIN" run --no-sync python - "$API_BASE_URL/models" "$SERVER_PID" <<'PY'
+if ! "$UV_BIN" run --no-sync python - \
+    "$API_BASE_URL/models" "$SERVER_PID" "$SERVER_START_TIMEOUT" <<'PY'
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 url = sys.argv[1]
 server_pid = int(sys.argv[2])
-deadline = time.monotonic() + 1800
+timeout = int(sys.argv[3])
+deadline = time.monotonic() + timeout
 while time.monotonic() < deadline:
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
@@ -170,9 +199,31 @@ while time.monotonic() < deadline:
         os.kill(server_pid, 0)
     except OSError:
         raise SystemExit("vLLM exited before becoming ready")
+    stat_path = Path(f"/proc/{server_pid}/stat")
+    if stat_path.exists() and stat_path.read_text().split()[2] == "Z":
+        raise SystemExit("vLLM exited before becoming ready")
     time.sleep(5)
-raise SystemExit("Timed out waiting 30 minutes for vLLM")
+raise SystemExit(f"Timed out waiting {timeout} seconds for vLLM")
 PY
+then
+    printf '\n%s\n' 'ERROR: vLLM failed to become ready.' >&2
+    if wait "$SERVER_PID"; then
+        server_status=0
+    else
+        server_status=$?
+    fi
+    SERVER_PID=""
+    printf 'vLLM exit status: %s\n' "$server_status" >&2
+    printf 'Full server log: %s\n' "$SERVER_LOG" >&2
+    if [[ -s "$SERVER_LOG" ]]; then
+        printf '%s\n' "--- Last $SERVER_LOG_LINES vLLM log lines ---" >&2
+        tail -n "$SERVER_LOG_LINES" "$SERVER_LOG" >&2
+        printf '%s\n' '--- End vLLM log ---' >&2
+    else
+        printf '%s\n' 'The vLLM log is empty; check Conda, CUDA, and executable availability.' >&2
+    fi
+    exit 1
+fi
 
 case "$BENCHMARK" in
     mmiu)

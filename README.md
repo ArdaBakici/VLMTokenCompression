@@ -252,6 +252,12 @@ synchronizes `uv.lock`, downloads MMIU, extracts it, launches vLLM, and evaluate
 the model. Later runs reuse the environment and extracted-data marker while the
 evaluator resumes its existing output.
 
+vLLM startup output is streamed to the terminal and saved under the run result
+directory. If startup fails, the launcher prints the last 200 log lines. Set
+`STREAM_SERVER_LOGS=0` to keep startup output only in the file,
+`SERVER_LOG_LINES` to change the failure excerpt, or `SERVER_START_TIMEOUT` to
+change the readiness timeout in seconds.
+
 MMIU on one visible GPU:
 
 ```bash
