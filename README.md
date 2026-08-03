@@ -58,8 +58,10 @@ uv run hf download FanqingM/MMIU-Benchmark \
   --local-dir data/MMIU
 ```
 
-Extract every ZIP into `data/MMIU`. Paths must match `input_image_path`, for
-example:
+Each ZIP must be extracted into a directory matching its archive stem. For
+example, extract `High-level-sub-semantic.zip` into
+`data/MMIU/High-level-sub-semantic`, not directly into `data/MMIU`. Paths must
+match `input_image_path`, for example:
 
 ```text
 data/MMIU/High-level-obj-semantic/person_reid/person_reid_0_0.jpg
@@ -251,6 +253,11 @@ The first run creates the Conda environment, installs uv from conda-forge,
 synchronizes `uv.lock`, downloads MMIU, extracts it, launches vLLM, and evaluates
 the model. Later runs reuse the environment and extracted-data marker while the
 evaluator resumes its existing output.
+
+The launcher validates all 79,259 referenced media files before starting vLLM.
+It also repairs data extracted by older versions of this script, which placed
+task directories directly under `data/MMIU`. Existing failed JSONL records are
+retried automatically after the media layout is repaired.
 
 vLLM startup output is streamed to the terminal and saved under the run result
 directory. If startup fails, the launcher prints the last 200 log lines. Set

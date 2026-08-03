@@ -91,7 +91,7 @@ fi
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
     MMIU_REVISION="03bf7d143d920e97a757f606b6b7baee161b019b"
     MMIU_ROOT="${MMIU_ROOT:-$PROJECT_DIR/data/MMIU}"
-    MMIU_MARKER="$MMIU_ROOT/.extracted-$MMIU_REVISION"
+    MMIU_MARKER="$MMIU_ROOT/.prepared-v2-$MMIU_REVISION"
     mkdir -p "$MMIU_ROOT"
 
     if [[ ! -f "$MMIU_MARKER" || ! -f "$MMIU_ROOT/all.parquet" ]]; then
@@ -101,24 +101,15 @@ if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
             --revision "$MMIU_REVISION" \
             --local-dir "$MMIU_ROOT"
 
-        printf 'Extracting MMIU media archives\n'
-        "$UV_BIN" run --no-sync python - "$MMIU_ROOT" <<'PY'
-import sys
-import zipfile
-from pathlib import Path
-
-root = Path(sys.argv[1])
-archives = sorted(root.glob("*.zip"))
-if not archives:
-    raise SystemExit(f"No ZIP archives found in {root}")
-for index, archive in enumerate(archives, 1):
-    print(f"[{index}/{len(archives)}] Extracting {archive.name}", flush=True)
-    with zipfile.ZipFile(archive) as handle:
-        handle.extractall(root)
-PY
-        printf '%s\n' "$MMIU_REVISION" >"$MMIU_MARKER"
+        "$UV_BIN" run --no-sync python scripts/prepare_mmiu.py \
+            --root "$MMIU_ROOT" \
+            --marker "$MMIU_MARKER" \
+            --prepare
     else
         printf 'Using prepared MMIU data in %s\n' "$MMIU_ROOT"
+        "$UV_BIN" run --no-sync python scripts/prepare_mmiu.py \
+            --root "$MMIU_ROOT" \
+            --marker "$MMIU_MARKER"
     fi
 fi
 
