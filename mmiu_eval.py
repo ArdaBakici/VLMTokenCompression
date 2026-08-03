@@ -279,6 +279,8 @@ def run(args: argparse.Namespace) -> None:
         "max_tokens": args.max_tokens,
         "indices": indices,
     }
+    if args.backend_signature is not None:
+        manifest["backend_signature"] = args.backend_signature
     ensure_manifest(args.output, manifest)
 
     existing = latest_by_index(read_jsonl(args.output))
@@ -457,6 +459,7 @@ def parser() -> argparse.ArgumentParser:
         "--image-transport", choices=("data-uri", "file-url"), default="data-uri"
     )
     run_parser.add_argument("--enable-thinking", action="store_true")
+    run_parser.add_argument("--backend-signature")
     run_parser.set_defaults(function=run)
 
     score_parser = subparsers.add_parser("score", help="score an existing JSONL result")

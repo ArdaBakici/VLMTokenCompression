@@ -17,12 +17,43 @@ SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-1800}"
 SERVER_LOG_LINES="${SERVER_LOG_LINES:-200}"
 STREAM_SERVER_LOGS="${STREAM_SERVER_LOGS:-1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
+SERVER_BACKEND="${SERVER_BACKEND:-vllm}"
+IMAGE_PRUNING_RATE="${IMAGE_PRUNING_RATE:-0.3}"
+VIT_ATTENTION_SCORE_LAYER_INDEX="${VIT_ATTENTION_SCORE_LAYER_INDEX:--2}"
+IMAGE_PRUNING_VLLM_REPOSITORY="https://github.com/shhn1/vllm.git"
+IMAGE_PRUNING_VLLM_COMMIT="d093d3037350eb7c9de1d149f9311432de2e0adb"
+IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
 
 if [[ "$BENCHMARK" != "mmiu" && "$BENCHMARK" != "crossvid" ]]; then
     printf 'Usage: %s {mmiu|crossvid} [MODEL]\n' "$0" >&2
     printf 'Alternatively set BENCHMARK and MODEL as environment variables.\n' >&2
     exit 2
 fi
+
+case "$SERVER_BACKEND" in
+    vllm)
+        ;;
+    vllm-pr38888-image-pruning)
+        if [[ "$BENCHMARK" != "mmiu" ]]; then
+            printf 'The experimental image-pruning profile currently supports only MMIU.\n' >&2
+            exit 2
+        fi
+        if [[ "$MODEL" != "Qwen/Qwen3-VL-8B-Instruct" ]]; then
+            printf 'The experimental image-pruning profile is pinned to Qwen/Qwen3-VL-8B-Instruct.\n' >&2
+            exit 2
+        fi
+        if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
+            printf '%s\n' \
+                'The experimental image-pruning backend is restricted to TENSOR_PARALLEL_SIZE=1.' \
+                'Tensor-parallel token selection is not validated by the upstream PR.' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        printf 'Unsupported SERVER_BACKEND=%s\n' "$SERVER_BACKEND" >&2
+        exit 2
+        ;;
+esac
 
 cd "$PROJECT_DIR"
 
@@ -59,7 +90,12 @@ if ! command -v conda >/dev/null 2>&1; then
     exit 2
 fi
 
-CONDA_ENV="${CONDA_ENV:-${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-bench}"
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    default_conda_env="${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-image-pruning-d093d3037"
+else
+    default_conda_env="${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-bench"
+fi
+CONDA_ENV="${CONDA_ENV:-$default_conda_env}"
 UV_BIN="$CONDA_ENV/bin/uv"
 if [[ ! -x "$UV_BIN" ]]; then
     if [[ "$BOOTSTRAP_CONDA" != "1" ]]; then
@@ -79,13 +115,60 @@ fi
 export UV_PROJECT_ENVIRONMENT="$CONDA_ENV"
 if [[ "$SYNC_ENV" == "1" ]]; then
     printf 'Synchronizing the locked environment into %s\n' "$CONDA_ENV"
-    "$UV_BIN" sync --frozen --inexact \
-        --python "$CONDA_ENV/bin/python" \
-        --extra crossvid \
-        --extra serve \
-        --no-dev
+    if [[ "$SERVER_BACKEND" == "vllm" ]]; then
+        "$UV_BIN" sync --frozen --inexact \
+            --python "$CONDA_ENV/bin/python" \
+            --extra crossvid \
+            --extra serve \
+            --no-dev
+    else
+        VLLM_USE_PRECOMPILED=1 \
+        VLLM_PRECOMPILED_WHEEL_COMMIT="$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+            "$UV_BIN" sync --frozen --inexact \
+                --python "$CONDA_ENV/bin/python" \
+                --extra crossvid \
+                --extra image-pruning \
+                --no-dev
+    fi
 else
     printf 'Skipping environment synchronization because SYNC_ENV=%s\n' "$SYNC_ENV"
+fi
+
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    VLLM_VERSION="$("$CONDA_ENV/bin/python" - \
+        "$IMAGE_PRUNING_RATE" "$VIT_ATTENTION_SCORE_LAYER_INDEX" <<'PY'
+from importlib.metadata import version
+import sys
+
+from vllm.config.multimodal import MultiModalConfig
+
+vllm_version = version("vllm")
+expected_version = "0.1.dev15469+gd093d3037.precompiled"
+if vllm_version != expected_version:
+    raise SystemExit(f"The active vLLM is not the pinned PR build: {vllm_version}")
+if "image_pruning_rate" not in MultiModalConfig.__pydantic_fields__:
+    raise SystemExit("The active vLLM does not expose image_pruning_rate")
+
+try:
+    pruning_rate = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("IMAGE_PRUNING_RATE must be a number") from exc
+if not 0.0 < pruning_rate < 1.0:
+    raise SystemExit("IMAGE_PRUNING_RATE must be greater than 0 and less than 1")
+
+try:
+    layer_index = int(sys.argv[2])
+except ValueError as exc:
+    raise SystemExit("VIT_ATTENTION_SCORE_LAYER_INDEX must be an integer") from exc
+if not -27 <= layer_index <= -1:
+    raise SystemExit(
+        "VIT_ATTENTION_SCORE_LAYER_INDEX must select one of the 27 vision layers "
+        "using an index from -27 through -1"
+    )
+print(vllm_version)
+PY
+    )"
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -136,6 +219,7 @@ trap 'exit 143' TERM INT
 
 printf '%s\n' '--- vLLM startup configuration ---'
 printf 'Model: %s\n' "$MODEL"
+printf 'Server backend: %s\n' "$SERVER_BACKEND"
 printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
 printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
@@ -160,6 +244,61 @@ vllm_command=(
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --limit-mm-per-prompt '{"image":128}'
 )
+
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    vllm_command+=(
+        --image-pruning-rate "$IMAGE_PRUNING_RATE"
+        --vit-attention-score-layer-index "$VIT_ATTENTION_SCORE_LAYER_INDEX"
+        --mm-encoder-attn-backend FLASH_ATTN
+        --no-enable-chunked-prefill
+    )
+
+    printf '%s\n' \
+        'WARNING: using an unmerged experimental vLLM PR for image-token pruning.' \
+        "Image pruning rate: $IMAGE_PRUNING_RATE" \
+        "ViT attention layer: $VIT_ATTENTION_SCORE_LAYER_INDEX" \
+        "vLLM source commit: $IMAGE_PRUNING_VLLM_COMMIT"
+
+    "$CONDA_ENV/bin/python" - \
+        "$RUN_DIR/server-config.json" \
+        "$SERVER_BACKEND" \
+        "$IMAGE_PRUNING_VLLM_REPOSITORY" \
+        "$IMAGE_PRUNING_VLLM_COMMIT" \
+        "$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+        "$VLLM_VERSION" \
+        "$IMAGE_PRUNING_RATE" \
+        "$VIT_ATTENTION_SCORE_LAYER_INDEX" \
+        "$MODEL" \
+        "${vllm_command[@]:4}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = {
+    "server_backend": sys.argv[2],
+    "source_repository": sys.argv[3],
+    "source_commit": sys.argv[4],
+    "precompiled_wheel_commit": sys.argv[5],
+    "vllm_version": sys.argv[6],
+    "image_pruning_rate": sys.argv[7],
+    "vit_attention_score_layer_index": sys.argv[8],
+    "mm_encoder_attention_backend": "FLASH_ATTN",
+    "model": sys.argv[9],
+    "tensor_parallel_size": 1,
+    "server_arguments": sys.argv[10:],
+}
+if path.exists():
+    actual = json.loads(path.read_text(encoding="utf-8"))
+    if actual != expected:
+        raise SystemExit(f"Run configuration does not match {path}")
+else:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+PY
+fi
 
 printf 'Starting vLLM and waiting up to %s seconds for readiness.\n' "$SERVER_START_TIMEOUT"
 if [[ "$STREAM_SERVER_LOGS" == "1" ]]; then
@@ -232,6 +371,9 @@ case "$BENCHMARK" in
             --output "$RUN_DIR/results.jsonl"
             --workers "$WORKERS"
         )
+        if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+            mmiu_arguments+=(--backend-signature "$BACKEND_SIGNATURE")
+        fi
         if [[ -n "${MMIU_LIMIT:-}" ]]; then
             mmiu_arguments+=(--limit "$MMIU_LIMIT")
         fi

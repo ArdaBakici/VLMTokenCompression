@@ -1,6 +1,14 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from mmiu_eval import build_prompt, option_labels, parse_choice, score_records
+from mmiu_eval import (
+    build_prompt,
+    ensure_manifest,
+    option_labels,
+    parse_choice,
+    score_records,
+)
 
 
 class ChoiceParsingTest(unittest.TestCase):
@@ -77,6 +85,30 @@ class ScoringTest(unittest.TestCase):
         score = score_records(records)
         self.assertEqual(score["failures"], 0)
         self.assertEqual(score["macro_accuracy"], 1.0)
+
+
+class ManifestTest(unittest.TestCase):
+    def test_backend_signature_prevents_mixed_resume(self):
+        configurations = (
+            (
+                {"model": "qwen"},
+                {"model": "qwen", "backend_signature": "pruned"},
+            ),
+            (
+                {"model": "qwen", "backend_signature": "pruned"},
+                {"model": "qwen"},
+            ),
+        )
+        for existing, resumed in configurations:
+            with (
+                self.subTest(existing=existing),
+                TemporaryDirectory() as temporary_directory,
+            ):
+                output = Path(temporary_directory) / "results.jsonl"
+                ensure_manifest(output, existing)
+
+                with self.assertRaises(SystemExit):
+                    ensure_manifest(output, resumed)
 
 
 if __name__ == "__main__":

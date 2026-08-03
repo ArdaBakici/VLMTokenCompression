@@ -10,5 +10,7 @@ Requires-Dist: decord>=0.6; extra == "crossvid"
 Requires-Dist: numpy>=1.26; extra == "crossvid"
 Requires-Dist: opencv-python>=4.10; extra == "crossvid"
 Requires-Dist: tqdm>=4.66; extra == "crossvid"
+Provides-Extra: image-pruning
+Requires-Dist: vllm; extra == "image-pruning"
 Provides-Extra: serve
 Requires-Dist: vllm<1,>=0.11; extra == "serve"

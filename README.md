@@ -220,6 +220,63 @@ fixed. For token-compression experiments, also record compression settings,
 model revision, vLLM version, GPU type, memory, latency, and throughput. The
 result manifests capture inference-facing settings but not custom model internals.
 
+## Experimental Image Pruning
+
+The repository includes an opt-in MMIU profile for the attention-based image
+token pruning proposed in vLLM PR
+[`#38888`](https://github.com/vllm-project/vllm/pull/38888). It prunes the
+lowest-scoring image tokens before decoder fusion and supports Qwen3-VL's image
+path through the existing OpenAI-compatible endpoint.
+
+This is a controlled research profile, not released vLLM functionality. The PR
+is unmerged, needs rebasing, and has no HTTP-level or tensor-parallel pruning
+test. Its checked-in Qwen3-VL tests use the 2B checkpoint rather than 8B. The
+implementation performs VisionZip-inspired dominant-token selection, not the
+complete dominant-plus-contextual-token VisionZip algorithm. Results must be
+reported as `vLLM PR #38888 image pruning`, not as upstream vLLM or full
+VisionZip.
+
+The profile is intentionally restricted to the dense
+`Qwen/Qwen3-VL-8B-Instruct` checkpoint on one GPU. It disables chunked prefill
+to avoid the M-RoPE media-boundary bug tracked in vLLM issue
+[`#48833`](https://github.com/vllm-project/vllm/issues/48833). This trades some
+serving throughput for correctness on MMIU's multi-image prompts.
+
+Run a ten-example smoke test on one visible H100:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+MMIU_LIMIT=10 \
+  scripts/run_mmiu_image_pruning.sh
+```
+
+The default pruning rate is 30%, which is the conservative setting recommended
+by the PR for OCR-heavy inputs. Override it for a separate run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+IMAGE_PRUNING_RATE=0.5 \
+  scripts/run_mmiu_image_pruning.sh
+```
+
+The launcher pins source commit
+`d093d3037350eb7c9de1d149f9311432de2e0adb`, installs it using compatible
+precompiled native extensions from upstream base commit
+`4eefbf9609e5ddb996e3ac37e192e92466ec35cc`, forces the FlashAttention vision
+backend, and rejects tensor parallelism. It uses a separate persistent Conda
+environment named `qwen3vl-image-pruning-d093d3037`, leaving the baseline vLLM
+environment untouched. The mutually exclusive baseline and image-pruning
+dependency graphs are both pinned in `uv.lock`. The first run builds the pinned
+source package using the compatible native wheel; later runs reuse the uv cache.
+The native wheel requires an x86-64 host with glibc 2.31 or newer.
+
+Each compressed run records `server-config.json` in its result directory.
+Resuming with a different model, pruning rate, attention layer, backend, or
+source revision is rejected by both the server configuration and MMIU manifest.
+As with the baseline, set
+`SYNC_ENV=0,BOOTSTRAP_CONDA=0` only after the dedicated environment has been
+installed successfully.
+
 ## Direct Bash
 
 `scripts/run_benchmark.sh` runs the same Conda bootstrap, uv synchronization,

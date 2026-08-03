@@ -19,6 +19,9 @@ crossvid = [
   "opencv-python>=4.10",
   "tqdm>=4.66",
 ]
+image-pruning = [
+  "vllm",
+]
 serve = [
   "vllm>=0.11,<1",
 ]
@@ -32,6 +35,22 @@ mmiu-eval = "mmiu_eval:main"
 dev = [
   "ruff>=0.12,<1",
 ]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "image-pruning" },
+    { extra = "serve" },
+  ],
+]
+
+[tool.uv.sources]
+vllm = [
+  { git = "https://github.com/shhn1/vllm.git", rev = "d093d3037350eb7c9de1d149f9311432de2e0adb", extra = "image-pruning" },
+]
+
+[tool.uv.extra-build-variables]
+vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "4eefbf9609e5ddb996e3ac37e192e92466ec35cc" }
 
 [tool.setuptools]
 py-modules = ["crossvid_eval", "crossvid_score", "mmiu_eval"]
