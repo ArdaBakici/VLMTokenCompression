@@ -223,6 +223,35 @@ result manifests capture inference-facing settings but not custom model internal
 `scripts/run_benchmark.sh` runs the same Conda bootstrap, uv synchronization,
 vLLM server, and evaluator without Slurm. Run it directly from any directory.
 
+For MMIU, the one-command launcher also downloads the pinned dataset and
+extracts its media archives before starting the benchmark:
+
+```bash
+scripts/run_mmiu.sh
+```
+
+It defaults to `Qwen/Qwen3-VL-8B-Instruct`, `data/MMIU`, and the persistent
+Conda prefix `${SCRATCH}/conda-envs/qwen3vl-bench` when `SCRATCH` is set. Supply
+a different model as the first argument:
+
+```bash
+scripts/run_mmiu.sh Qwen/Qwen3-VL-32B-Instruct
+```
+
+Override locations or run a short smoke test with environment variables:
+
+```bash
+CONDA_ENV=/scratch/$USER/conda-envs/qwen3vl-bench \
+MMIU_ROOT=/scratch/$USER/datasets/MMIU \
+MMIU_LIMIT=10 \
+  scripts/run_mmiu.sh
+```
+
+The first run creates the Conda environment, installs uv from conda-forge,
+synchronizes `uv.lock`, downloads MMIU, extracts it, launches vLLM, and evaluates
+the model. Later runs reuse the environment and extracted-data marker while the
+evaluator resumes its existing output.
+
 MMIU on one visible GPU:
 
 ```bash

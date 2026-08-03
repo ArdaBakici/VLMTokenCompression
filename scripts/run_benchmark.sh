@@ -85,6 +85,40 @@ else
     printf 'Skipping environment synchronization because SYNC_ENV=%s\n' "$SYNC_ENV"
 fi
 
+if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
+    MMIU_REVISION="03bf7d143d920e97a757f606b6b7baee161b019b"
+    MMIU_ROOT="${MMIU_ROOT:-$PROJECT_DIR/data/MMIU}"
+    MMIU_MARKER="$MMIU_ROOT/.extracted-$MMIU_REVISION"
+    mkdir -p "$MMIU_ROOT"
+
+    if [[ ! -f "$MMIU_MARKER" || ! -f "$MMIU_ROOT/all.parquet" ]]; then
+        printf 'Downloading MMIU revision %s into %s\n' "$MMIU_REVISION" "$MMIU_ROOT"
+        "$UV_BIN" run --no-sync hf download FanqingM/MMIU-Benchmark \
+            --repo-type dataset \
+            --revision "$MMIU_REVISION" \
+            --local-dir "$MMIU_ROOT"
+
+        printf 'Extracting MMIU media archives\n'
+        "$UV_BIN" run --no-sync python - "$MMIU_ROOT" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+archives = sorted(root.glob("*.zip"))
+if not archives:
+    raise SystemExit(f"No ZIP archives found in {root}")
+for index, archive in enumerate(archives, 1):
+    print(f"[{index}/{len(archives)}] Extracting {archive.name}", flush=True)
+    with zipfile.ZipFile(archive) as handle:
+        handle.extractall(root)
+PY
+        printf '%s\n' "$MMIU_REVISION" >"$MMIU_MARKER"
+    else
+        printf 'Using prepared MMIU data in %s\n' "$MMIU_ROOT"
+    fi
+fi
+
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/results}"
 MODEL_TAG="${MODEL//\//_}"
 RUN_DIR="${RUN_DIR:-$RESULTS_ROOT/$MODEL_TAG-$BENCHMARK}"
@@ -143,14 +177,19 @@ PY
 case "$BENCHMARK" in
     mmiu)
         MMIU_ROOT="${MMIU_ROOT:-$PROJECT_DIR/data/MMIU}"
-        "$UV_BIN" run --no-sync mmiu-eval run \
-            --model "$MODEL" \
-            --base-url "$API_BASE_URL" \
-            --api-key "$OPENAI_API_KEY" \
-            --media-root "$MMIU_ROOT" \
-            --dataset-path "$MMIU_ROOT/all.parquet" \
-            --output "$RUN_DIR/results.jsonl" \
+        mmiu_arguments=(
+            --model "$MODEL"
+            --base-url "$API_BASE_URL"
+            --api-key "$OPENAI_API_KEY"
+            --media-root "$MMIU_ROOT"
+            --dataset-path "$MMIU_ROOT/all.parquet"
+            --output "$RUN_DIR/results.jsonl"
             --workers "$WORKERS"
+        )
+        if [[ -n "${MMIU_LIMIT:-}" ]]; then
+            mmiu_arguments+=(--limit "$MMIU_LIMIT")
+        fi
+        "$UV_BIN" run --no-sync mmiu-eval run "${mmiu_arguments[@]}"
         ;;
     crossvid)
         CROSSVID_ROOT="${CROSSVID_ROOT:-$PROJECT_DIR/data/CrossVid}"
