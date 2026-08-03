@@ -279,7 +279,10 @@ vLLM startup output is streamed to the terminal and saved under the run result
 directory. If startup fails, the launcher prints the last 200 log lines. Set
 `STREAM_SERVER_LOGS=0` to keep startup output only in the file,
 `SERVER_LOG_LINES` to change the failure excerpt, or `SERVER_START_TIMEOUT` to
-change the readiness timeout in seconds.
+change the readiness timeout in seconds. Some image shapes trigger Triton JIT
+compilation when first encountered during inference. The launcher allows 900
+seconds for these requests by default; override `REQUEST_TIMEOUT` and
+`VLLM_ENGINE_ITERATION_TIMEOUT_S` if needed.
 
 MMIU on one visible GPU:
 
