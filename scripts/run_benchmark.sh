@@ -115,8 +115,12 @@ fi
 
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/results}"
 MODEL_TAG="${MODEL//\//_}"
-RUN_DIR="${RUN_DIR:-$RESULTS_ROOT/$MODEL_TAG-$BENCHMARK}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${SLURM_JOB_ID:-$$}}"
+RUN_DIR="${RUN_DIR:-$RESULTS_ROOT/$MODEL_TAG-$BENCHMARK/$RUN_ID}"
 mkdir -p "$RUN_DIR"
+
+printf 'Run ID: %s\n' "$RUN_ID"
+printf 'Run directory: %s\n' "$RUN_DIR"
 
 SERVER_LOG="$RUN_DIR/vllm-${SLURM_JOB_ID:-local}.log"
 API_BASE_URL="http://127.0.0.1:$PORT/v1"

@@ -251,8 +251,24 @@ MMIU_LIMIT=10 \
 
 The first run creates the Conda environment, installs uv from conda-forge,
 synchronizes `uv.lock`, downloads MMIU, extracts it, launches vLLM, and evaluates
-the model. Later runs reuse the environment and extracted-data marker while the
-evaluator resumes its existing output.
+the model. Later runs reuse the environment and extracted-data marker.
+
+Every invocation creates a unique result directory using a UTC timestamp and
+the process or Slurm job ID:
+
+```text
+results/Qwen_Qwen3-VL-8B-Instruct-mmiu/20260803T142530Z-12345/
+```
+
+This prevents a new run from overwriting or appending to previous results. To
+resume a specific interrupted run, explicitly pass its existing directory:
+
+```bash
+RUN_DIR=/path/to/existing/run scripts/run_mmiu.sh
+```
+
+You can also set `RUN_ID` to choose a stable name while retaining the standard
+model/benchmark directory hierarchy.
 
 The launcher validates all 79,259 referenced media files before starting vLLM.
 It also repairs data extracted by older versions of this script, which placed
