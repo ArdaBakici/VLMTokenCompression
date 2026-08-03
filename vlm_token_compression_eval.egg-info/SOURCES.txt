@@ -1,0 +1,11 @@
+README.md
+crossvid_eval.py
+crossvid_score.py
+mmiu_eval.py
+pyproject.toml
+vlm_token_compression_eval.egg-info/PKG-INFO
+vlm_token_compression_eval.egg-info/SOURCES.txt
+vlm_token_compression_eval.egg-info/dependency_links.txt
+vlm_token_compression_eval.egg-info/entry_points.txt
+vlm_token_compression_eval.egg-info/requires.txt
+vlm_token_compression_eval.egg-info/top_level.txt

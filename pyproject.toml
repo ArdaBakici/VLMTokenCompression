@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm-token-compression-eval"
+version = "0.1.0"
+description = "Reproducible benchmark runners for VLM token compression experiments"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "datasets>=2.20,<5",
+  "openai>=1.40,<3",
+]
+
+[project.optional-dependencies]
+crossvid = [
+  "decord>=0.6",
+  "numpy>=1.26",
+  "opencv-python>=4.10",
+  "tqdm>=4.66",
+]
+serve = [
+  "vllm>=0.11,<1",
+]
+
+[project.scripts]
+crossvid-eval = "crossvid_eval:main"
+crossvid-score = "crossvid_score:main"
+mmiu-eval = "mmiu_eval:main"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.12,<1",
+]
+
+[tool.setuptools]
+py-modules = ["crossvid_eval", "crossvid_score", "mmiu_eval"]
+
+[tool.ruff]
+exclude = [".venv", "vendor"]

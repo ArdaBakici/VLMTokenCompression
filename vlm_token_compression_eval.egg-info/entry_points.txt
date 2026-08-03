@@ -1,0 +1,4 @@
+[console_scripts]
+crossvid-eval = crossvid_eval:main
+crossvid-score = crossvid_score:main
+mmiu-eval = mmiu_eval:main
