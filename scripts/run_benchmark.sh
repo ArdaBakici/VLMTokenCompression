@@ -214,6 +214,7 @@ vllm_command=(
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --limit-mm-per-prompt '{"image":128}'
+    --compilation-config.pass_config.fuse_allreduce_rms false
 )
 
 printf 'Starting vLLM and waiting up to %s seconds for readiness.\n' "$SERVER_START_TIMEOUT"
