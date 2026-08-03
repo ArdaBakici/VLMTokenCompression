@@ -7,7 +7,7 @@ PROJECT_DIR="${PROJECT_DIR:-$(dirname "$SCRIPT_DIR")}"
 BENCHMARK="${BENCHMARK:-${1:-}}"
 MODEL="${MODEL:-${2:-Qwen/Qwen3-VL-8B-Instruct}}"
 PORT="${PORT:-8000}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 WORKERS="${WORKERS:-4}"
@@ -88,6 +88,59 @@ else
     printf 'Skipping environment synchronization because SYNC_ENV=%s\n' "$SYNC_ENV"
 fi
 
+count_gpu_list() {
+    local value="$1"
+    local -a gpu_ids
+    IFS=',' read -r -a gpu_ids <<< "$value"
+    printf '%s\n' "${#gpu_ids[@]}"
+}
+
+detected_gpu_count=1
+gpu_detection_source="single-GPU default"
+if [[ "${SLURM_GPUS_ON_NODE:-}" =~ ^[1-9][0-9]*$ ]]; then
+    detected_gpu_count="$SLURM_GPUS_ON_NODE"
+    gpu_detection_source="SLURM_GPUS_ON_NODE"
+elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "$CUDA_VISIBLE_DEVICES" != "-1" ]]; then
+    detected_gpu_count="$(count_gpu_list "$CUDA_VISIBLE_DEVICES")"
+    gpu_detection_source="CUDA_VISIBLE_DEVICES"
+elif [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    detected_gpu_count="$(count_gpu_list "$SLURM_JOB_GPUS")"
+    gpu_detection_source="SLURM_JOB_GPUS"
+fi
+
+if [[ -z "$TENSOR_PARALLEL_SIZE" ]]; then
+    TENSOR_PARALLEL_SIZE="$detected_gpu_count"
+fi
+if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'TENSOR_PARALLEL_SIZE must be a positive integer, got %q.\n' \
+        "$TENSOR_PARALLEL_SIZE" >&2
+    exit 2
+fi
+
+if ! runtime_gpu_count="$($UV_BIN run --no-sync python - <<'PY'
+import torch
+
+print(torch.cuda.device_count())
+PY
+)"; then
+    printf '%s\n' 'Failed to query CUDA devices through PyTorch.' >&2
+    exit 2
+fi
+if [[ ! "$runtime_gpu_count" =~ ^[0-9]+$ ]]; then
+    printf 'Unexpected PyTorch CUDA device count: %q\n' "$runtime_gpu_count" >&2
+    exit 2
+fi
+if (( runtime_gpu_count < TENSOR_PARALLEL_SIZE )); then
+    printf '%s\n' \
+        'GPU allocation error:' \
+        "  Tensor parallel size: $TENSOR_PARALLEL_SIZE" \
+        "  PyTorch-visible GPUs: $runtime_gpu_count" \
+        "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<not set>}" \
+        "  SLURM_GPUS_ON_NODE: ${SLURM_GPUS_ON_NODE:-<not set>}" \
+        'Request/bind enough GPUs or lower TENSOR_PARALLEL_SIZE.' >&2
+    exit 2
+fi
+
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
     MMIU_REVISION="03bf7d143d920e97a757f606b6b7baee161b019b"
     MMIU_ROOT="${MMIU_ROOT:-$PROJECT_DIR/data/MMIU}"
@@ -137,13 +190,15 @@ trap 'exit 143' TERM INT
 printf '%s\n' '--- vLLM startup configuration ---'
 printf 'Model: %s\n' "$MODEL"
 printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
+printf 'Detected GPU count: %s (from %s)\n' "$detected_gpu_count" "$gpu_detection_source"
+printf 'PyTorch-visible GPU count: %s\n' "$runtime_gpu_count"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
 printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
 printf 'GPU memory utilization: %s\n' "$GPU_MEMORY_UTILIZATION"
 printf 'Conda environment: %s\n' "$CONDA_ENV"
 printf 'Server log: %s\n' "$SERVER_LOG"
 if command -v nvidia-smi >/dev/null 2>&1; then
-    printf '%s\n' 'Visible GPUs:'
+    printf '%s\n' 'nvidia-smi GPU inventory (may ignore CUDA_VISIBLE_DEVICES):'
     nvidia-smi --list-gpus || true
 else
     printf '%s\n' 'Warning: nvidia-smi is not available.'

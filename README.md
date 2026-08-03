@@ -297,6 +297,12 @@ TENSOR_PARALLEL_SIZE=4 \
   scripts/run_benchmark.sh crossvid Qwen/Qwen3-VL-32B-Instruct
 ```
 
+The launcher automatically derives tensor parallelism from
+`SLURM_GPUS_ON_NODE` or `CUDA_VISIBLE_DEVICES`. An explicit
+`TENSOR_PARALLEL_SIZE` overrides detection. Before launching vLLM it checks
+`torch.cuda.device_count()` and stops with allocation diagnostics if fewer GPUs
+are actually visible than requested.
+
 The first invocation creates the Conda prefix, installs uv from conda-forge,
 and synchronizes the locked dependencies. Override `CONDA_ENV` to control where
 that environment is stored. Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` on later runs to
