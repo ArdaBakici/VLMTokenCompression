@@ -242,6 +242,25 @@ to avoid the M-RoPE media-boundary bug tracked in vLLM issue
 [`#48833`](https://github.com/vllm-project/vllm/issues/48833). This trades some
 serving throughput for correctness on MMIU's multi-image prompts.
 
+The launcher also applies one local source patch,
+`sequential-image-encoding-v1`, to the installed pinned build. vLLM charges an
+image against the multimodal encoder compute budget using the number of tokens
+it contributes to the prompt, which pruning reduces, while the vision tower
+still runs on every unpruned patch. Disabling chunked prefill additionally
+raises that budget to `--max-model-len`. Together these let the scheduler pack
+several whole MMIU prompts into a single vision-tower forward, far beyond what
+startup memory profiling reserved, which exhausts device memory on an 80 GB or
+94 GB H100. vLLM already encodes pruned media one item at a time for Efficient
+Video Sampling, but gates that path to the video modality;
+`scripts/patch_image_pruning_encoder.py` extends the gate to images. It changes
+only how many images share one vision-tower call, not the generated output,
+pruning rate, context length, or scored coverage. The patch is idempotent and
+refuses to run if the pinned revision stops matching what it expects. Report it
+alongside the PR, and record `encoder_patch` from `server-config.json` with the
+other compression settings. Set `IMAGE_PRUNING_ENCODER_PATCH=0` to reproduce
+unpatched upstream behavior; single-image or short prompts stay within memory,
+but MMIU's multi-image prompts do not.
+
 Run a ten-example smoke test on one visible H100:
 
 ```bash
@@ -271,8 +290,9 @@ source package using the compatible native wheel; later runs reuse the uv cache.
 The native wheel requires an x86-64 host with glibc 2.31 or newer.
 
 Each compressed run records `server-config.json` in its result directory.
-Resuming with a different model, pruning rate, attention layer, backend, or
-source revision is rejected by both the server configuration and MMIU manifest.
+Resuming with a different model, pruning rate, attention layer, backend, source
+revision, or encoder patch is rejected by both the server configuration and MMIU
+manifest.
 As with the baseline, set
 `SYNC_ENV=0,BOOTSTRAP_CONDA=0` only after the dedicated environment has been
 installed successfully.

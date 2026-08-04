@@ -20,6 +20,7 @@ OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 SERVER_BACKEND="${SERVER_BACKEND:-vllm}"
 IMAGE_PRUNING_RATE="${IMAGE_PRUNING_RATE:-0.3}"
 VIT_ATTENTION_SCORE_LAYER_INDEX="${VIT_ATTENTION_SCORE_LAYER_INDEX:--2}"
+IMAGE_PRUNING_ENCODER_PATCH="${IMAGE_PRUNING_ENCODER_PATCH:-1}"
 IMAGE_PRUNING_VLLM_REPOSITORY="https://github.com/shhn1/vllm.git"
 IMAGE_PRUNING_VLLM_COMMIT="d093d3037350eb7c9de1d149f9311432de2e0adb"
 IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
@@ -168,7 +169,24 @@ if not -27 <= layer_index <= -1:
 print(vllm_version)
 PY
     )"
-    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false"
+    # The scheduler spends the multimodal encoder compute budget in post-pruning
+    # tokens, so the vision tower receives far more unpruned patches per forward
+    # than memory profiling assumed. Encoding pruned images one at a time keeps
+    # the vision tower inside the profiled budget without changing any generated
+    # output. See scripts/patch_image_pruning_encoder.py.
+    if [[ "$IMAGE_PRUNING_ENCODER_PATCH" == "1" ]]; then
+        ENCODER_PATCH="$("$CONDA_ENV/bin/python" \
+            scripts/patch_image_pruning_encoder.py --print-id)"
+        "$CONDA_ENV/bin/python" scripts/patch_image_pruning_encoder.py
+    else
+        ENCODER_PATCH="none"
+        printf '%s\n' \
+            'WARNING: IMAGE_PRUNING_ENCODER_PATCH=0 leaves the sequential image' \
+            'encoder patch unapplied. Multi-image prompts can exhaust device' \
+            'memory in the vision tower.' >&2
+    fi
+
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -269,6 +287,7 @@ if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
         "$IMAGE_PRUNING_RATE" \
         "$VIT_ATTENTION_SCORE_LAYER_INDEX" \
         "$MODEL" \
+        "$ENCODER_PATCH" \
         "${vllm_command[@]:4}" <<'PY'
 import json
 import os
@@ -287,7 +306,8 @@ expected = {
     "mm_encoder_attention_backend": "FLASH_ATTN",
     "model": sys.argv[9],
     "tensor_parallel_size": 1,
-    "server_arguments": sys.argv[10:],
+    "encoder_patch": sys.argv[10],
+    "server_arguments": sys.argv[11:],
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))
