@@ -124,6 +124,9 @@ media access in the server.
 
 ## CrossVid Data
 
+`scripts/run_crossvid.sh` performs every step in this section and the next one.
+Follow them manually only when driving the pieces separately.
+
 Download the pinned CrossVid release, which is about 312 GB:
 
 ```bash
@@ -141,7 +144,15 @@ obtained from their original repositories and merged into
 uv run crossvid-score inspect --qa-dir data/CrossVid/QA
 ```
 
-The expected total is 9,015 examples.
+The expected total is 9,015 examples. `scripts/prepare_crossvid.py` checks that
+total along with every referenced video and the per-view UAV frame directories
+and bounding-box files:
+
+```bash
+uv run python scripts/prepare_crossvid.py \
+  --root data/CrossVid \
+  --marker data/CrossVid/.prepared-4cc98eee034e6f3950c19803485402661f54c1f8
+```
 
 ## CrossVid Evaluation
 
@@ -351,6 +362,47 @@ The launcher validates all 79,259 referenced media files before starting vLLM.
 It also repairs data extracted by older versions of this script, which placed
 task directories directly under `data/MMIU`. Existing failed JSONL records are
 retried automatically after the media layout is repaired.
+
+CrossVid has the same one-command launcher. It clones the pinned upstream
+checkout, downloads the pinned dataset revision, validates the annotations and
+media, starts vLLM, and runs all ten tasks:
+
+```bash
+scripts/run_crossvid.sh
+```
+
+It accepts the same model argument, `RUN_DIR`, and `RUN_ID` handling as
+`scripts/run_mmiu.sh`, and reads `CROSSVID_ROOT`, `CROSSVID_TASK`, `FRAMES`,
+`FRAME_LENGTH`, and `WORKERS`. Set `JUDGE_MODEL` to judge CCQA and compute the
+aggregate score in the same invocation:
+
+```bash
+CROSSVID_ROOT=/scratch/$USER/datasets/CrossVid \
+JUDGE_MODEL=Qwen/Qwen3-32B \
+JUDGE_BASE_URL=http://127.0.0.1:8001/v1 \
+  scripts/run_crossvid.sh
+```
+
+Budget for the download: the pinned release is about 312 GB, and the first run
+fetches all of it. It resumes if interrupted, and later runs reuse the marker in
+`CROSSVID_ROOT`. `crossvid_eval.py` imports the official media preprocessors, so
+the launcher also clones `vendor/CrossVid` and checks out the pinned commit when
+it is absent; override the location with `CROSSVID_VENDOR_ROOT`.
+
+Validation covers all ten annotation files, the released total of 9,015
+examples, every referenced video, and the per-view UAV frame directories and
+bounding-box files that MSR and MOC read. The behavior genre is the expected
+gap: Charades and Animal Kingdom forbid redistribution, so those videos are
+never part of the download and must be merged into `videos/behavior` from their
+original repositories. The launcher refuses to start when they are absent,
+because every example that reads them would fail and would still count in the
+denominator of the reported score. To benchmark the remaining genres anyway:
+
+```bash
+CROSSVID_ALLOW_MISSING_BEHAVIOR=1 scripts/run_crossvid.sh
+```
+
+Report that as reduced coverage, not as a CrossVid score.
 
 vLLM startup output is streamed to the terminal and saved under the run result
 directory. If startup fails, the launcher prints the last 200 log lines. Set

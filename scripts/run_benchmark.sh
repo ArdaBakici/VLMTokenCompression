@@ -21,6 +21,9 @@ SERVER_BACKEND="${SERVER_BACKEND:-vllm}"
 IMAGE_PRUNING_RATE="${IMAGE_PRUNING_RATE:-0.3}"
 VIT_ATTENTION_SCORE_LAYER_INDEX="${VIT_ATTENTION_SCORE_LAYER_INDEX:--2}"
 IMAGE_PRUNING_ENCODER_PATCH="${IMAGE_PRUNING_ENCODER_PATCH:-1}"
+CROSSVID_REPOSITORY="https://github.com/chuntianli666/CrossVid.git"
+CROSSVID_COMMIT="b53ada63551f9ac4a726b381b627d17ece066281"
+CROSSVID_VENDOR_ROOT="${CROSSVID_VENDOR_ROOT:-$PROJECT_DIR/vendor/CrossVid}"
 IMAGE_PRUNING_VLLM_REPOSITORY="https://github.com/shhn1/vllm.git"
 IMAGE_PRUNING_VLLM_COMMIT="d093d3037350eb7c9de1d149f9311432de2e0adb"
 IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
@@ -212,6 +215,54 @@ if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
             --root "$MMIU_ROOT" \
             --marker "$MMIU_MARKER"
     fi
+fi
+
+if [[ "$BENCHMARK" == "crossvid" && "${PREPARE_CROSSVID:-0}" == "1" ]]; then
+    CROSSVID_DATASET_REVISION="4cc98eee034e6f3950c19803485402661f54c1f8"
+    CROSSVID_ROOT="${CROSSVID_ROOT:-$PROJECT_DIR/data/CrossVid}"
+    CROSSVID_MARKER="$CROSSVID_ROOT/.prepared-$CROSSVID_DATASET_REVISION"
+    mkdir -p "$CROSSVID_ROOT"
+
+    # crossvid_eval.py imports the official media preprocessors, so the pinned
+    # upstream checkout is a hard requirement rather than a provenance copy.
+    if [[ ! -d "$CROSSVID_VENDOR_ROOT/.git" ]]; then
+        if [[ -e "$CROSSVID_VENDOR_ROOT" ]]; then
+            printf '%s\n' \
+                "CROSSVID_VENDOR_ROOT=$CROSSVID_VENDOR_ROOT exists but is not a" \
+                'git checkout. Remove it or point CROSSVID_VENDOR_ROOT elsewhere.' >&2
+            exit 2
+        fi
+        printf 'Cloning CrossVid into %s\n' "$CROSSVID_VENDOR_ROOT"
+        git clone "$CROSSVID_REPOSITORY" "$CROSSVID_VENDOR_ROOT"
+    fi
+    if [[ "$(git -C "$CROSSVID_VENDOR_ROOT" rev-parse HEAD)" != "$CROSSVID_COMMIT" ]]; then
+        printf 'Checking out CrossVid %s\n' "$CROSSVID_COMMIT"
+        git -C "$CROSSVID_VENDOR_ROOT" fetch --quiet origin "$CROSSVID_COMMIT" || \
+            git -C "$CROSSVID_VENDOR_ROOT" fetch --quiet origin
+        git -C "$CROSSVID_VENDOR_ROOT" checkout --quiet "$CROSSVID_COMMIT"
+    fi
+
+    if [[ ! -f "$CROSSVID_MARKER" || ! -d "$CROSSVID_ROOT/QA" ]]; then
+        printf '%s\n' \
+            "Downloading CrossVid $CROSSVID_DATASET_REVISION into $CROSSVID_ROOT." \
+            'The pinned release is about 312 GB. The download resumes if interrupted.'
+        "$UV_BIN" run --no-sync hf download Chuntianli/CrossVid \
+            --repo-type dataset \
+            --revision "$CROSSVID_DATASET_REVISION" \
+            --local-dir "$CROSSVID_ROOT"
+    else
+        printf 'Using prepared CrossVid data in %s\n' "$CROSSVID_ROOT"
+    fi
+
+    prepare_crossvid_arguments=(
+        --root "$CROSSVID_ROOT"
+        --marker "$CROSSVID_MARKER"
+    )
+    if [[ "${CROSSVID_ALLOW_MISSING_BEHAVIOR:-0}" == "1" ]]; then
+        prepare_crossvid_arguments+=(--allow-missing-behavior)
+    fi
+    "$UV_BIN" run --no-sync python scripts/prepare_crossvid.py \
+        "${prepare_crossvid_arguments[@]}"
 fi
 
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/results}"
@@ -410,6 +461,7 @@ case "$BENCHMARK" in
             --qa-dir "$CROSSVID_ROOT/QA" \
             --video-root "$CROSSVID_ROOT/videos" \
             --uav-root "$CROSSVID_ROOT/uav" \
+            --vendor-root "$CROSSVID_VENDOR_ROOT" \
             --results-dir "$RUN_DIR" \
             --workers "$WORKERS" \
             --frames "${FRAMES:-128}" \
