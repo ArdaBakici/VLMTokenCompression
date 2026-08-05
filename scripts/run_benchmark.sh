@@ -42,8 +42,17 @@ case "$SERVER_BACKEND" in
             printf 'The experimental image-pruning profile currently supports only MMIU.\n' >&2
             exit 2
         fi
-        if [[ "$MODEL" != "Qwen/Qwen3-VL-8B-Instruct" ]]; then
-            printf 'The experimental image-pruning profile is pinned to Qwen/Qwen3-VL-8B-Instruct.\n' >&2
+        # Both checkpoints share the 27-layer Qwen3-VL vision tower that the PR
+        # scores, so VIT_ATTENTION_SCORE_LAYER_INDEX means the same thing for
+        # each. Other checkpoints are unvalidated: a different vision depth
+        # silently changes which layer the attention scores come from.
+        image_pruning_models=(
+            "Qwen/Qwen3-VL-8B-Instruct"
+            "Qwen/Qwen3-VL-30B-A3B-Instruct"
+        )
+        if [[ ! " ${image_pruning_models[*]} " == *" $MODEL "* ]]; then
+            printf 'The experimental image-pruning profile supports only:\n' >&2
+            printf '  %s\n' "${image_pruning_models[@]}" >&2
             exit 2
         fi
         if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
@@ -178,21 +187,21 @@ if not -27 <= layer_index <= -1:
 print(vllm_version)
 PY
     )"
-    # The scheduler spends the multimodal encoder compute budget in post-pruning
-    # tokens, so the vision tower receives far more unpruned patches per forward
-    # than memory profiling assumed. Encoding pruned images one at a time keeps
-    # the vision tower inside the profiled budget without changing any generated
-    # output. See scripts/patch_image_pruning_encoder.py.
+    # The pinned PR build needs two local corrections before it serves MMIU:
+    # the vision tower must encode pruned images one at a time to stay inside
+    # the profiled memory budget, and the MoE checkpoint must assign the image
+    # pruning attribute that its inherited image path reads. See
+    # scripts/patch_image_pruning.py.
     if [[ "$IMAGE_PRUNING_ENCODER_PATCH" == "1" ]]; then
         ENCODER_PATCH="$("$CONDA_ENV/bin/python" \
-            scripts/patch_image_pruning_encoder.py --print-id)"
-        "$CONDA_ENV/bin/python" scripts/patch_image_pruning_encoder.py
+            scripts/patch_image_pruning.py --print-id)"
+        "$CONDA_ENV/bin/python" scripts/patch_image_pruning.py
     else
         ENCODER_PATCH="none"
         printf '%s\n' \
-            'WARNING: IMAGE_PRUNING_ENCODER_PATCH=0 leaves the sequential image' \
-            'encoder patch unapplied. Multi-image prompts can exhaust device' \
-            'memory in the vision tower.' >&2
+            'WARNING: IMAGE_PRUNING_ENCODER_PATCH=0 leaves the local vLLM patches' \
+            'unapplied. Multi-image prompts can exhaust device memory in the' \
+            'vision tower, and MoE checkpoints fail on their first image.' >&2
     fi
 
     BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH"

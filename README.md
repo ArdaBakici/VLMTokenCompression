@@ -263,30 +263,45 @@ complete dominant-plus-contextual-token VisionZip algorithm. Results must be
 reported as `vLLM PR #38888 image pruning`, not as upstream vLLM or full
 VisionZip.
 
-The profile is intentionally restricted to the dense
-`Qwen/Qwen3-VL-8B-Instruct` checkpoint on one GPU. It disables chunked prefill
-to avoid the M-RoPE media-boundary bug tracked in vLLM issue
+The profile runs on one GPU and accepts `Qwen/Qwen3-VL-8B-Instruct` and
+`Qwen/Qwen3-VL-30B-A3B-Instruct`. Both share the 27-layer Qwen3-VL vision tower
+the PR scores, so `VIT_ATTENTION_SCORE_LAYER_INDEX` selects the same layer in
+each; a checkpoint with a different vision depth would silently score a
+different layer, which is why the list is an allowlist rather than a warning.
+The profile disables chunked prefill to avoid the M-RoPE media-boundary bug
+tracked in vLLM issue
 [`#48833`](https://github.com/vllm-project/vllm/issues/48833). This trades some
 serving throughput for correctness on MMIU's multi-image prompts.
 
-The launcher also applies one local source patch,
-`sequential-image-encoding-v1`, to the installed pinned build. vLLM charges an
-image against the multimodal encoder compute budget using the number of tokens
-it contributes to the prompt, which pruning reduces, while the vision tower
-still runs on every unpruned patch. Disabling chunked prefill additionally
-raises that budget to `--max-model-len`. Together these let the scheduler pack
-several whole MMIU prompts into a single vision-tower forward, far beyond what
-startup memory profiling reserved, which exhausts device memory on an 80 GB or
-94 GB H100. vLLM already encodes pruned media one item at a time for Efficient
-Video Sampling, but gates that path to the video modality;
-`scripts/patch_image_pruning_encoder.py` extends the gate to images. It changes
-only how many images share one vision-tower call, not the generated output,
-pruning rate, context length, or scored coverage. The patch is idempotent and
-refuses to run if the pinned revision stops matching what it expects. Report it
-alongside the PR, and record `encoder_patch` from `server-config.json` with the
-other compression settings. Set `IMAGE_PRUNING_ENCODER_PATCH=0` to reproduce
-unpatched upstream behavior; single-image or short prompts stay within memory,
-but MMIU's multi-image prompts do not.
+The launcher also applies two local source patches to the installed pinned
+build, `scripts/patch_image_pruning.py`. Both are idempotent and refuse to run
+if the pinned revision stops matching what they expect. Report them alongside
+the PR, and record `encoder_patch` from `server-config.json` with the other
+compression settings.
+
+`sequential-image-encoding-v1` bounds vision-tower memory. vLLM charges an image
+against the multimodal encoder compute budget using the number of tokens it
+contributes to the prompt, which pruning reduces, while the vision tower still
+runs on every unpruned patch. Disabling chunked prefill additionally raises that
+budget to `--max-model-len`. Together these let the scheduler pack several whole
+MMIU prompts into a single vision-tower forward, far beyond what startup memory
+profiling reserved, which exhausts device memory on an 80 GB or 94 GB H100. vLLM
+already encodes pruned media one item at a time for Efficient Video Sampling but
+gates that path to the video modality; the patch extends the gate to images. It
+changes only how many images share one vision-tower call, not the generated
+output, pruning rate, context length, or scored coverage.
+
+`moe-image-pruning-rate-v1` is what makes the MoE checkpoint usable.
+`Qwen3VLMoeForConditionalGeneration.__init__` calls `super()` on the grandparent
+class, skipping the dense `__init__` that assigns `image_pruning_rate`, while
+inheriting every image path that reads it. Both classes share one multimodal
+processor, so the prompt placeholders are already shortened by the pruning rate
+before the model raises `AttributeError` on its first image. The patch assigns
+the attribute the inherited code expects.
+
+Set `IMAGE_PRUNING_ENCODER_PATCH=0` to reproduce unpatched upstream behavior.
+Short or single-image prompts stay within memory on the dense checkpoint, but
+MMIU's multi-image prompts do not, and the MoE checkpoint fails immediately.
 
 Run a ten-example smoke test on one visible H100:
 
@@ -304,6 +319,20 @@ CUDA_VISIBLE_DEVICES=0 \
 IMAGE_PRUNING_RATE=0.5 \
   scripts/run_mmiu_image_pruning.sh
 ```
+
+Pass the MoE checkpoint as the first argument to prune it instead:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  scripts/run_mmiu_image_pruning.sh Qwen/Qwen3-VL-30B-A3B-Instruct
+```
+
+It needs a 94 GB card: 62.1 GB of bfloat16 weights, a 1.6 GB deepstack buffer
+sized by `max_num_batched_tokens`, and 12.9 GB of KV cache for 131,072 tokens
+fit the 83.8 GB that `--gpu-memory-utilization 0.90` reserves, with the vision
+tower inside the profiled budget once the patches are applied. This profile
+rejects tensor parallelism, so on an 80 GB card the only option is to shorten
+`MAX_MODEL_LEN` and accept that longer MMIU rows are recorded as failures.
 
 The launcher pins source commit
 `d093d3037350eb7c9de1d149f9311432de2e0adb`, installs it using compatible
