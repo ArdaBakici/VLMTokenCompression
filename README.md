@@ -118,6 +118,22 @@ the official task-dependent prompt ordering and macro-average, but requests and
 deterministically extracts one option letter. Report this extraction difference
 when comparing results with the original leaderboard.
 
+Because unparseable answers are scored as incorrect, a model that phrases its
+answers differently can lose macro accuracy without answering worse. Compare the
+`Invalid predictions` counts of two runs before comparing their scores, and
+inspect the discarded rows with:
+
+```bash
+uv run python scripts/show_invalid.py results/Qwen_Qwen3-VL-8B-Instruct-mmiu/<run>
+```
+
+It accepts a `results.jsonl` file, a run directory, or a tree of run
+directories, and reports API failures and unparseable predictions separately,
+grouped by task and by reason, with the raw prediction text and the run's
+`max_tokens`. Predictions that all stop near one length were truncated by
+`--max-tokens` rather than malformed. Use `--task` to focus on one task,
+`--limit 0` to print every row, and `--width 0` to stop truncating the text.
+
 For `--image-transport file-url`, start vLLM with a suitable
 `--allowed-local-media-path`. The default `data-uri` transport needs no local
 media access in the server.
