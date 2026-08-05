@@ -75,9 +75,12 @@ def parse_choice(prediction: str, valid_labels: set[str]) -> str | None:
     if direct and direct.group(1).upper() in valid_labels:
         return direct.group(1).upper()
 
+    # The delimiter class must stay a single class: writing it as [\])].,:;]
+    # closes after ")" and stops "B. Yes", the most common option format, from
+    # ever matching.
     patterns = (
         r"^\s*(?:the\s+)?(?:correct\s+)?answer\s*(?:is|:)\s*[\[(]?([A-N])\b",
-        r"^\s*[\[(]?([A-N])(?:[\])].,:;]|\s|$)",
+        r"^\s*[\[(]?([A-N])(?=[.,:;)\]]|\s|$)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -376,7 +379,38 @@ def score_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def print_score(output: Path, strict: bool) -> None:
+def reparse_records(records: list[dict[str, Any]], dataset: Any) -> list[dict[str, Any]]:
+    """Recompute choices from stored predictions with the current extractor.
+
+    Answer extraction is deterministic, so a fixed extractor can be applied to
+    predictions that are already stored instead of running inference again. The
+    stored records are never modified: the caller scores the returned copies.
+    """
+
+    reparsed = []
+    for record in records:
+        prediction = record.get("prediction")
+        if not record.get("success") or prediction is None:
+            reparsed.append(record)
+            continue
+        index = int(record["index"])
+        if index >= len(dataset):
+            raise SystemExit(
+                f"Record index {index} is outside the dataset; the results and "
+                "the dataset revision do not match"
+            )
+        row = dataset[index]
+        if row["task"] != record["task"]:
+            raise SystemExit(
+                f"Record index {index} is task {record['task']!r} but the dataset "
+                f"holds {row['task']!r}; the results belong to another dataset"
+            )
+        labels = option_labels(row.get("options") or "")
+        reparsed.append({**record, "choice": parse_choice(prediction, labels)})
+    return reparsed
+
+
+def print_score(output: Path, strict: bool, dataset: Any = None) -> None:
     records = read_jsonl(output)
     manifest_file = manifest_path(output)
     missing = 0
@@ -390,6 +424,14 @@ def print_score(output: Path, strict: bool) -> None:
         records = [record for index, record in latest.items() if index in expected]
     elif strict:
         raise SystemExit(f"Strict scoring requires the run manifest: {manifest_file}")
+    if dataset is not None:
+        stored = score_records(records)
+        records = reparse_records(records, dataset)
+        print(
+            "Re-parsed stored predictions with the current extractor. "
+            f"Recorded macro accuracy was {stored['macro_accuracy'] * 100:.4f} with "
+            f"{stored['invalid_predictions']} invalid predictions."
+        )
     score = score_records(records)
 
     print("task,correct,total,accuracy")
@@ -403,6 +445,11 @@ def print_score(output: Path, strict: bool) -> None:
     )
     if strict and (missing or unexpected or score["failures"]):
         raise SystemExit("Strict scoring failed because the run is invalid or incomplete")
+
+
+def score_command(args: argparse.Namespace) -> None:
+    dataset = load_mmiu(args.dataset_path) if args.reparse else None
+    print_score(args.output, args.strict, dataset)
 
 
 def inspect_dataset(args: argparse.Namespace) -> None:
@@ -465,9 +512,14 @@ def parser() -> argparse.ArgumentParser:
     score_parser = subparsers.add_parser("score", help="score an existing JSONL result")
     score_parser.add_argument("--output", required=True, type=Path)
     score_parser.add_argument("--strict", action="store_true")
-    score_parser.set_defaults(
-        function=lambda args: print_score(args.output, args.strict)
+    score_parser.add_argument(
+        "--reparse",
+        action="store_true",
+        help="rescore stored predictions with the current extractor, without "
+        "modifying the results file",
     )
+    score_parser.add_argument("--dataset-path", help="optional local all.parquet path")
+    score_parser.set_defaults(function=score_command)
     return root
 
 

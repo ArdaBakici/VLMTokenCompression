@@ -7,6 +7,7 @@ from mmiu_eval import (
     ensure_manifest,
     option_labels,
     parse_choice,
+    reparse_records,
     score_records,
 )
 
@@ -21,9 +22,63 @@ class ChoiceParsingTest(unittest.TestCase):
         self.assertEqual(parse_choice("The correct answer is C.", labels), "C")
         self.assertEqual(parse_choice("D because it is last", labels), "D")
 
+    def test_parses_a_letter_followed_by_its_option_text(self):
+        # Qwen3-VL-30B-A3B answers MMIU this way, and an earlier delimiter class
+        # that closed after ")" discarded every one of these rows.
+        labels = {"A", "B", "C", "D"}
+        self.assertEqual(parse_choice("B. Yes", labels), "B")
+        self.assertEqual(parse_choice("A. Much weaker", labels), "A")
+        self.assertEqual(parse_choice("C.Clearer", labels), "C")
+        self.assertEqual(parse_choice("D: much better", labels), "D")
+        self.assertEqual(parse_choice("B) Sharper", labels), "B")
+        self.assertEqual(parse_choice("[C]", labels), "C")
+
     def test_rejects_invalid_or_ambiguous_answers(self):
         self.assertIsNone(parse_choice("E", {"A", "B", "C", "D"}))
         self.assertIsNone(parse_choice("I cannot tell", {"A", "B", "C", "D"}))
+        self.assertIsNone(parse_choice("E. Not an offered option", {"A", "B", "C"}))
+
+
+DATASET = (
+    {"task": "video_captioning", "options": "A: one\nB: two\nC: three"},
+    {"task": "video_captioning", "options": "A: one\nB: two"},
+    {"task": "temporal_ordering", "options": "A: one\nB: two"},
+)
+
+
+class ReparseTest(unittest.TestCase):
+    dataset = DATASET
+
+    def record(self, index, **overrides):
+        base = {
+            "index": index,
+            "task": self.dataset[index]["task"],
+            "success": True,
+            "prediction": "B. two",
+            "choice": None,
+        }
+        return {**base, **overrides}
+
+    def test_recovers_choices_without_touching_the_stored_records(self):
+        records = [self.record(0)]
+        reparsed = reparse_records(records, self.dataset)
+        self.assertEqual(reparsed[0]["choice"], "B")
+        self.assertIsNone(records[0]["choice"])
+
+    def test_keeps_failures_and_answers_outside_the_options(self):
+        records = [
+            self.record(0, success=False, prediction=None),
+            self.record(1, prediction="C. three"),
+        ]
+        reparsed = reparse_records(records, self.dataset)
+        self.assertIsNone(reparsed[0]["choice"])
+        self.assertIsNone(reparsed[1]["choice"])
+
+    def test_rejects_results_from_another_dataset(self):
+        with self.assertRaises(SystemExit):
+            reparse_records([self.record(0, task="temporal_ordering")], self.dataset)
+        with self.assertRaises(SystemExit):
+            reparse_records([self.record(0) | {"index": 99}], self.dataset)
 
 
 class PromptTest(unittest.TestCase):
