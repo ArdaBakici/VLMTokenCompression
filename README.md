@@ -432,15 +432,19 @@ later runs to skip synchronization entirely.
 
 Environments live in `${SCRATCH}/conda-envs/` when `SCRATCH` is set and in
 `PROJECT_DIR/conda-envs/` otherwise, under a per-backend name so the baseline
-and image-pruning dependency graphs stay separate. `CONDA_ENV_ROOT` moves that
-whole directory, which is the right knob on a site without scratch:
+and image-pruning dependency graphs stay separate. `CONDA_ENV_DIR` moves that
+whole directory. Point it at your Conda environments directory to keep the
+prefixes where `conda env list` already looks:
 
 ```bash
-CONDA_ENV_ROOT=/home/$USER scripts/run_mmiu.sh
+CONDA_ENV_DIR="$HOME/.conda/envs" scripts/run_mmiu.sh
 ```
 
+That creates `~/.conda/envs/qwen3vl-bench`, which conda then treats as a named
+environment you can `conda activate qwen3vl-bench`.
+
 `CONDA_ENV` still overrides the full path of a single environment. Prefer
-`CONDA_ENV_ROOT` when you use both server backends: one exported `CONDA_ENV`
+`CONDA_ENV_DIR` when you use both server backends: one exported `CONDA_ENV`
 points them at the same prefix, and each `uv sync` then replaces the other
 backend's vLLM build. Expect roughly 20 GB per environment, and note that the
 uv cache, Hugging Face cache, and Conda package cache are separate: they follow
