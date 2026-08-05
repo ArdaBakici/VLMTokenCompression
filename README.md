@@ -427,9 +427,25 @@ TENSOR_PARALLEL_SIZE=4 \
 ```
 
 The first invocation creates the Conda prefix, installs uv from conda-forge,
-and synchronizes the locked dependencies. Override `CONDA_ENV` to control where
-that environment is stored. Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` on later runs to
-skip synchronization entirely.
+and synchronizes the locked dependencies. Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` on
+later runs to skip synchronization entirely.
+
+Environments live in `${SCRATCH}/conda-envs/` when `SCRATCH` is set and in
+`PROJECT_DIR/conda-envs/` otherwise, under a per-backend name so the baseline
+and image-pruning dependency graphs stay separate. `CONDA_ENV_ROOT` moves that
+whole directory, which is the right knob on a site without scratch:
+
+```bash
+CONDA_ENV_ROOT=/home/$USER scripts/run_mmiu.sh
+```
+
+`CONDA_ENV` still overrides the full path of a single environment. Prefer
+`CONDA_ENV_ROOT` when you use both server backends: one exported `CONDA_ENV`
+points them at the same prefix, and each `uv sync` then replaces the other
+backend's vLLM build. Expect roughly 20 GB per environment, and note that the
+uv cache, Hugging Face cache, and Conda package cache are separate: they follow
+`UV_CACHE_DIR`, `HF_HOME`, and `CONDA_PKGS_DIRS`, which default to `${SCRATCH}`
+or `$HOME/.cache`.
 
 ## Slurm
 

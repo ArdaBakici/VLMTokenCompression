@@ -94,10 +94,15 @@ if ! command -v conda >/dev/null 2>&1; then
     exit 2
 fi
 
+# Parent directory of the per-backend Conda prefixes. Set CONDA_ENV_ROOT to move
+# every environment at once, for example to /home/$USER on a site without a
+# scratch filesystem. Set CONDA_ENV to place one environment explicitly, keeping
+# in mind that the two server backends must not share a prefix.
+CONDA_ENV_ROOT="${CONDA_ENV_ROOT:-${SCRATCH:-$PROJECT_DIR}}"
 if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
-    default_conda_env="${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-image-pruning-d093d3037"
+    default_conda_env="$CONDA_ENV_ROOT/conda-envs/qwen3vl-image-pruning-d093d3037"
 else
-    default_conda_env="${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-bench"
+    default_conda_env="$CONDA_ENV_ROOT/conda-envs/qwen3vl-bench"
 fi
 CONDA_ENV="${CONDA_ENV:-$default_conda_env}"
 UV_BIN="$CONDA_ENV/bin/uv"
