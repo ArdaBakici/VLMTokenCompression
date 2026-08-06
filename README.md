@@ -247,6 +247,67 @@ fixed. For token-compression experiments, also record compression settings,
 model revision, vLLM version, GPU type, memory, latency, and throughput. The
 result manifests capture inference-facing settings but not custom model internals.
 
+Two wrappers report on completed runs. Neither starts a server, synchronizes the
+lockfile, or bootstraps Conda: they locate an environment that already has the
+project installed and read result files. Set `CONDA_ENV` or `CONDA_ENV_DIR` if
+your environments are somewhere unusual.
+
+`scripts/show_results.sh` prints one row per run:
+
+```bash
+scripts/show_results.sh                     # RESULTS_ROOT, or ./results
+scripts/show_results.sh path/to/results     # a tree, a run, or a results.jsonl
+REPARSE=1 scripts/show_results.sh           # rescore with the current extractor
+scripts/show_results.sh --json              # machine-readable
+```
+
+`scripts/score_results.sh` runs each benchmark's own scorer instead, printing the
+official per-task tables:
+
+```bash
+scripts/score_results.sh                    # every run under ./results
+scripts/score_results.sh path/to/run        # one run
+STRICT=0 scripts/score_results.sh           # report instead of failing
+```
+
+It dispatches on what a run directory holds: `results.jsonl` is scored with
+`mmiu-eval score`, `{task}_result.json` files with `crossvid-score score`, which
+also refreshes that run's `summary.json`. Strict scoring is on by default, so the
+script exits nonzero when any run is incomplete or had API failures, but every
+run is scored first — one bad run does not hide the others.
+
+Both wrappers call `scripts/show_runs.py`, which can also be run directly:
+
+```bash
+uv run python scripts/show_runs.py results
+```
+
+```text
+benchmark  model                           profile                         rows    fail   invalid        score
+mmiu       Qwen/Qwen3-VL-30B-A3B-Instruct  prune=0.3 layer=-2 glibc-shim   11698   0      1179 (10.1%)   55.10
+mmiu       Qwen/Qwen3-VL-8B-Instruct       baseline                        11698   0      87 (0.7%)      58.73
+```
+
+It reads MMIU runs from their JSONL, applying the same manifest filtering strict
+scoring uses, and reports CrossVid runs from the `summary.json` that
+`crossvid-score score` wrote. Read `fail` and `invalid` before comparing `score`:
+API failures and unparseable answers are both counted as incorrect, so either can
+move the headline number without the model behaving differently, and the run with
+more of them is not comparable to its neighbour.
+
+Because answer extraction is deterministic, `--reparse` rescores stored
+predictions with the current extractor and shows both numbers, without modifying
+any results file:
+
+```bash
+uv run python scripts/show_runs.py results \
+  --reparse --dataset-path data/MMIU/all.parquet
+```
+
+Add `--json` for machine-readable output. The `profile` column comes from each
+run's `server-config.json`, so compressed runs report their pruning rate,
+attention layer and any local patches alongside the score.
+
 ## Experimental Image Pruning
 
 The repository includes an opt-in MMIU profile for the attention-based image
@@ -327,12 +388,29 @@ CUDA_VISIBLE_DEVICES=0 \
   scripts/run_mmiu_image_pruning.sh Qwen/Qwen3-VL-30B-A3B-Instruct
 ```
 
-It needs a 94 GB card: 62.1 GB of bfloat16 weights, a 1.6 GB deepstack buffer
-sized by `max_num_batched_tokens`, and 12.9 GB of KV cache for 131,072 tokens
-fit the 83.8 GB that `--gpu-memory-utilization 0.90` reserves, with the vision
-tower inside the profiled budget once the patches are applied. This profile
-rejects tensor parallelism, so on an 80 GB card the only option is to shorten
-`MAX_MODEL_LEN` and accept that longer MMIU rows are recorded as failures.
+It needs a 94 GB card and a shorter context than the dense checkpoint. Measured
+on one 93.1 GiB H100 at `--gpu-memory-utilization 0.90`, which reserves 83.8 GiB:
+62.1 GiB of bfloat16 weights and 0.7 GiB of CUDA graphs leave 21 GiB, and roughly
+14 GiB of that goes to the activation peak of the profiling forward pass. Only
+6.8 GiB remains for KV cache, against the 12.0 GiB that one 131,072-token
+sequence needs at 96 KiB per token.
+
+Shortening the context helps twice, because disabling chunked prefill ties
+`max_num_batched_tokens` to `max_model_len`, so the profiling peak shrinks along
+with the per-sequence requirement:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+MAX_MODEL_LEN=73728 \
+  scripts/run_mmiu_image_pruning.sh Qwen/Qwen3-VL-30B-A3B-Instruct
+```
+
+Use the same `MAX_MODEL_LEN` for every arm being compared, including the dense
+checkpoint, or the arms differ in which MMIU rows they can answer at all. Rows
+whose prompt exceeds the context are rejected by the server and recorded as
+failures, which strict scoring counts and reports as `API failures`; check that
+count before trusting a comparison. This profile rejects tensor parallelism, so
+splitting the model across GPUs is not an option here.
 
 The launcher pins source commit
 `d093d3037350eb7c9de1d149f9311432de2e0adb`, installs it using compatible

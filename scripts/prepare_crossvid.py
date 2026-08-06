@@ -111,6 +111,18 @@ def report(missing: list[str], label: str, help_text: str) -> None:
     print(help_text)
 
 
+def list_missing(root: Path, output: Path | None) -> None:
+    """Print every absent media path, one per line, for fetching or diffing."""
+
+    missing = missing_media(root / "QA", root / "videos", root / "uav")
+    text = "".join(f"{path}\n" for path in missing)
+    if output is None:
+        print(text, end="")
+    else:
+        output.write_text(text, encoding="utf-8")
+        print(f"Wrote {len(missing)} absent paths to {output}")
+
+
 def validate(root: Path, marker: Path, allow_restricted: bool) -> None:
     qa_dir = root / "QA"
     counts = count_examples(qa_dir)
@@ -164,14 +176,30 @@ def validate(root: Path, marker: Path, allow_restricted: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--marker", required=True, type=Path)
+    parser.add_argument("--marker", type=Path)
     parser.add_argument(
         "--allow-missing-behavior",
         action="store_true",
         help="Benchmark the available genres when the behavior videos are absent.",
     )
+    parser.add_argument(
+        "--list-missing",
+        action="store_true",
+        help="Print every absent media path instead of validating.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="With --list-missing, write the paths to this file instead of stdout.",
+    )
     args = parser.parse_args()
-    validate(args.root.resolve(), args.marker, args.allow_missing_behavior)
+    root = args.root.resolve()
+    if args.list_missing:
+        list_missing(root, args.output)
+        return
+    if args.marker is None:
+        raise SystemExit("--marker is required unless --list-missing is given")
+    validate(root, args.marker, args.allow_missing_behavior)
 
 
 if __name__ == "__main__":
