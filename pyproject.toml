@@ -49,8 +49,14 @@ vllm = [
   { git = "https://github.com/shhn1/vllm.git", rev = "d093d3037350eb7c9de1d149f9311432de2e0adb", extra = "image-pruning" },
 ]
 
+# VLLM_PRECOMPILED_WHEEL_VARIANT pins the CUDA build of the native extensions.
+# Without it, vLLM's setup.py detects the variant from torch, and falls back to
+# parsing nvidia-smi when torch is not importable, which it never is inside uv's
+# isolated build. On a host whose driver reports CUDA 13 that silently installs
+# cu130 extensions next to the CUDA 12 torch this extra pins, and _moe_C.abi3.so
+# then fails to load.
 [tool.uv.extra-build-variables]
-vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "4eefbf9609e5ddb996e3ac37e192e92466ec35cc" }
+vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "4eefbf9609e5ddb996e3ac37e192e92466ec35cc", VLLM_PRECOMPILED_WHEEL_VARIANT = "cu129" }
 
 [tool.setuptools]
 py-modules = ["crossvid_eval", "crossvid_score", "mmiu_eval"]

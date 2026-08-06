@@ -27,6 +27,12 @@ CROSSVID_VENDOR_ROOT="${CROSSVID_VENDOR_ROOT:-$PROJECT_DIR/vendor/CrossVid}"
 IMAGE_PRUNING_VLLM_REPOSITORY="https://github.com/shhn1/vllm.git"
 IMAGE_PRUNING_VLLM_COMMIT="d093d3037350eb7c9de1d149f9311432de2e0adb"
 IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
+# The image-pruning extra pins torch 2.10, which depends on nvidia-*-cu12, so the
+# native extensions must come from the CUDA 12 wheel. Left unset, vLLM's setup.py
+# detects the variant from nvidia-smi whenever torch is not importable, which it
+# never is inside uv's isolated build, and a driver reporting CUDA 13 then yields
+# cu130 extensions that fail to load. Keep this in step with pyproject.toml.
+IMAGE_PRUNING_WHEEL_VARIANT="${IMAGE_PRUNING_WHEEL_VARIANT:-cu129}"
 
 if [[ "$BENCHMARK" != "mmiu" && "$BENCHMARK" != "crossvid" ]]; then
     printf 'Usage: %s {mmiu|crossvid} [MODEL]\n' "$0" >&2
@@ -143,6 +149,7 @@ if [[ "$SYNC_ENV" == "1" ]]; then
     else
         VLLM_USE_PRECOMPILED=1 \
         VLLM_PRECOMPILED_WHEEL_COMMIT="$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+        VLLM_PRECOMPILED_WHEEL_VARIANT="$IMAGE_PRUNING_WHEEL_VARIANT" \
             "$UV_BIN" sync --frozen --inexact \
                 --python "$CONDA_ENV/bin/python" \
                 --extra crossvid \
@@ -167,6 +174,27 @@ if vllm_version != expected_version:
     raise SystemExit(f"The active vLLM is not the pinned PR build: {vllm_version}")
 if "image_pruning_rate" not in MultiModalConfig.__pydantic_fields__:
     raise SystemExit("The active vLLM does not expose image_pruning_rate")
+
+# The native extensions come from a precompiled wheel, so a CUDA variant that
+# does not match the pinned torch loads partially: vLLM logs the failure and
+# continues, and the missing operator only surfaces once a model calls it. MoE
+# checkpoints hit this during memory profiling, minutes into startup.
+import torch
+
+try:
+    import vllm._moe_C  # noqa: F401
+except ImportError as exc:
+    raise SystemExit(
+        f"The vLLM MoE extension does not load: {exc}\n"
+        f"The installed torch is built for CUDA {torch.version.cuda}. Rebuild "
+        "the environment with IMAGE_PRUNING_WHEEL_VARIANT set to the matching "
+        "wheel variant, for example cu129 for CUDA 12 or cu130 for CUDA 13."
+    ) from exc
+if not hasattr(torch.ops._moe_C, "topk_softmax"):
+    raise SystemExit(
+        "The vLLM MoE extension loaded without registering topk_softmax; the "
+        "precompiled wheel does not match the pinned source revision"
+    )
 
 try:
     pruning_rate = float(sys.argv[1])
@@ -204,7 +232,7 @@ PY
             'vision tower, and MoE checkpoints fail on their first image.' >&2
     fi
 
-    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH"
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;variant=$IMAGE_PRUNING_WHEEL_VARIANT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -349,6 +377,7 @@ if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
         "$IMAGE_PRUNING_VLLM_REPOSITORY" \
         "$IMAGE_PRUNING_VLLM_COMMIT" \
         "$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+        "$IMAGE_PRUNING_WHEEL_VARIANT" \
         "$VLLM_VERSION" \
         "$IMAGE_PRUNING_RATE" \
         "$VIT_ATTENTION_SCORE_LAYER_INDEX" \
@@ -366,14 +395,15 @@ expected = {
     "source_repository": sys.argv[3],
     "source_commit": sys.argv[4],
     "precompiled_wheel_commit": sys.argv[5],
-    "vllm_version": sys.argv[6],
-    "image_pruning_rate": sys.argv[7],
-    "vit_attention_score_layer_index": sys.argv[8],
+    "precompiled_wheel_variant": sys.argv[6],
+    "vllm_version": sys.argv[7],
+    "image_pruning_rate": sys.argv[8],
+    "vit_attention_score_layer_index": sys.argv[9],
     "mm_encoder_attention_backend": "FLASH_ATTN",
-    "model": sys.argv[9],
+    "model": sys.argv[10],
     "tensor_parallel_size": 1,
-    "encoder_patch": sys.argv[10],
-    "server_arguments": sys.argv[11:],
+    "encoder_patch": sys.argv[11],
+    "server_arguments": sys.argv[12:],
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))

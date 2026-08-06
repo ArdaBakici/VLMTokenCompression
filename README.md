@@ -345,10 +345,24 @@ dependency graphs are both pinned in `uv.lock`. The first run builds the pinned
 source package using the compatible native wheel; later runs reuse the uv cache.
 The native wheel requires an x86-64 host with glibc 2.31 or newer.
 
+The wheel's CUDA variant is pinned to `cu129` in both `pyproject.toml` and
+`IMAGE_PRUNING_WHEEL_VARIANT`, because the image-pruning extra resolves to torch
+2.10, which depends on `nvidia-cuda-runtime-cu12`. Left unpinned, vLLM's
+`setup.py` detects the variant from `torch.version.cuda` and falls back to
+parsing `nvidia-smi` when torch is not importable, which it never is inside uv's
+isolated build. On a host whose driver reports CUDA 13 that installs `cu130`
+extensions beside a CUDA 12 torch. The mismatch is quiet: vLLM logs the failed
+import of `_moe_C` and carries on, so a dense checkpoint still serves and a MoE
+checkpoint dies during memory profiling with
+`'_OpNamespace' '_moe_C' object has no attribute 'topk_softmax'`. The launcher
+now imports that extension right after synchronizing and refuses to start if it
+does not load. Override `IMAGE_PRUNING_WHEEL_VARIANT` only to match a different
+pinned torch, and rebuild the environment when you change it.
+
 Each compressed run records `server-config.json` in its result directory.
 Resuming with a different model, pruning rate, attention layer, backend, source
-revision, or encoder patch is rejected by both the server configuration and MMIU
-manifest.
+revision, wheel variant, or encoder patch is rejected by both the server
+configuration and MMIU manifest.
 As with the baseline, set
 `SYNC_ENV=0,BOOTSTRAP_CONDA=0` only after the dedicated environment has been
 installed successfully.
