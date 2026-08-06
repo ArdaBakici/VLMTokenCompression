@@ -203,25 +203,7 @@ if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
     # MoE checkpoints usable below glibc 2.31.
     GLIBC_SHIM="none"
     if [[ "$IMAGE_PRUNING_GLIBC_SHIM" == "1" ]]; then
-        if ! command -v patchelf >/dev/null 2>&1; then
-            printf '%s\n' \
-                'IMAGE_PRUNING_GLIBC_SHIM=1 requires patchelf. Install it with:' \
-                "  conda install --yes --prefix $CONDA_ENV --channel conda-forge patchelf" >&2
-            exit 2
-        fi
-        moe_extension="$("$CONDA_ENV/bin/python" - <<'PY'
-import pathlib
-
-import vllm
-
-extensions = sorted(pathlib.Path(vllm.__file__).parent.glob("_moe_C*.so"))
-if not extensions:
-    raise SystemExit("The installed vLLM has no MoE extension to rebind")
-print(extensions[0])
-PY
-        )"
-        patchelf --clear-symbol-version log2 "$moe_extension"
-        printf 'Rebound log2 to its base version in %s\n' "$moe_extension"
+        "$CONDA_ENV/bin/python" scripts/rebind_moe_glibc.py
         GLIBC_SHIM="glibc-log2-downgrade-v1"
     fi
 

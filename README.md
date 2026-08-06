@@ -368,10 +368,8 @@ unaffected.
 That single symbol is the whole floor: apart from it the extension needs nothing
 above glibc 2.14. `log2` has been exported as `log2@GLIBC_2.2.5` since glibc
 2.2.5, and 2.29 added a faster implementation of the same function under a new
-version tag. `IMAGE_PRUNING_GLIBC_SHIM=1` runs
-`patchelf --clear-symbol-version log2` against the installed extension, which
-rebinds it to the base version present on every host, and relaxes the launcher's
-glibc check:
+version tag. `IMAGE_PRUNING_GLIBC_SHIM=1` runs `scripts/rebind_moe_glibc.py`
+against the installed extension and relaxes the launcher's glibc check:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -379,9 +377,18 @@ IMAGE_PRUNING_GLIBC_SHIM=1 \
   scripts/run_mmiu_image_pruning.sh Qwen/Qwen3-VL-30B-A3B-Instruct
 ```
 
-It needs `patchelf`, which the launcher tells you how to install if it is
-missing, and it is recorded as `glibc_shim` in `server-config.json` and in the
-MMIU backend signature. Report it with the other local modifications. The two
+The script changes two bytes and needs no external tooling. It clears the
+symbol's entry in `.gnu.version`, so `log2` binds to whichever implementation the
+host provides, and marks the `libm.so.6` requirement in `.gnu.version_r` as
+`VER_FLG_WEAK`, so the loader reports the missing version instead of refusing to
+load. Both edits are required: `patchelf --clear-symbol-version` performs only
+the first, and the fatal error comes from the second table, which the loader
+checks in `_dl_check_map_versions` before binding any symbol. The script is
+idempotent, `--verify` reports whether an extension is already rebound, and
+running it against a build that does not import the symbol is a no-op.
+
+The rebinding is recorded as `glibc_shim` in `server-config.json` and in the MMIU
+backend signature. Report it with the other local modifications. The two
 implementations of `log2` differ only in accuracy at the last bit and in errno
 handling, and the MoE extension uses it for kernel sizing rather than for model
 arithmetic, but it is a local change to a compiled artifact and belongs in the
