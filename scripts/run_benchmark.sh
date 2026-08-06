@@ -61,6 +61,22 @@ case "$SERVER_BACKEND" in
             printf '  %s\n' "${image_pruning_models[@]}" >&2
             exit 2
         fi
+        # MoE checkpoints route through vllm/_moe_C.abi3.so, which the precompiled
+        # manylinux_2_31 wheel builds against glibc 2.31. Dense checkpoints never
+        # load that extension and keep working on older hosts, so this is checked
+        # per model rather than for the whole profile.
+        image_pruning_moe_models=("Qwen/Qwen3-VL-30B-A3B-Instruct")
+        host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+        if [[ " ${image_pruning_moe_models[*]} " == *" $MODEL "* && -n "$host_glibc" ]] \
+            && [[ "$(printf '%s\n2.31\n' "$host_glibc" | sort --version-sort | head -n 1)" != "2.31" ]]; then
+            printf '%s\n' \
+                "This host provides glibc $host_glibc, but the precompiled vLLM" \
+                'wheel needs 2.31 or newer for its MoE extension. Dense' \
+                'checkpoints do not load that extension and still run here.' \
+                'Run the MoE checkpoint on a newer node or inside a container,' \
+                'or benchmark a dense checkpoint on this one.' >&2
+            exit 2
+        fi
         if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
             printf '%s\n' \
                 'The experimental image-pruning backend is restricted to TENSOR_PARALLEL_SIZE=1.' \
@@ -122,13 +138,26 @@ else
 fi
 CONDA_ENV="${CONDA_ENV:-$default_conda_env}"
 UV_BIN="$CONDA_ENV/bin/uv"
-if [[ ! -x "$UV_BIN" ]]; then
+CONDA_PYTHON="$CONDA_ENV/bin/python"
+if [[ ! -x "$UV_BIN" || ! -x "$CONDA_PYTHON" ]]; then
     if [[ "$BOOTSTRAP_CONDA" != "1" ]]; then
-        printf 'uv is missing from CONDA_ENV=%s and BOOTSTRAP_CONDA=0.\n' "$CONDA_ENV" >&2
+        printf 'uv or python is missing from CONDA_ENV=%s and BOOTSTRAP_CONDA=0.\n' \
+            "$CONDA_ENV" >&2
         exit 2
     fi
-    if [[ -d "$CONDA_ENV" ]]; then
+    if [[ -x "$CONDA_PYTHON" ]]; then
         conda install --yes --prefix "$CONDA_ENV" --channel conda-forge uv
+    elif [[ -e "$CONDA_ENV" ]]; then
+        # uv is a standalone binary, so installing it into a prefix that has no
+        # interpreter succeeds and leaves an environment uv itself rejects with
+        # "not a valid Python environment". An interrupted conda create leaves
+        # exactly this behind, and repairing it in place is not reliable.
+        printf '%s\n' \
+            "CONDA_ENV=$CONDA_ENV exists but has no Python interpreter." \
+            'An interrupted conda create leaves this behind. Remove the prefix' \
+            'and run again:' \
+            "  rm -rf $CONDA_ENV" >&2
+        exit 2
     else
         conda create --yes --prefix "$CONDA_ENV" --channel conda-forge python=3.11 uv
     fi
@@ -186,9 +215,12 @@ try:
 except ImportError as exc:
     raise SystemExit(
         f"The vLLM MoE extension does not load: {exc}\n"
-        f"The installed torch is built for CUDA {torch.version.cuda}. Rebuild "
-        "the environment with IMAGE_PRUNING_WHEEL_VARIANT set to the matching "
-        "wheel variant, for example cu129 for CUDA 12 or cu130 for CUDA 13."
+        "A GLIBC_2.xx message means this host is older than the manylinux_2_31 "
+        "wheel requires; run MoE checkpoints on a newer node or in a container, "
+        "or benchmark a dense checkpoint here. A CUDA or undefined-symbol "
+        f"message means the wheel variant does not match torch, which is built "
+        f"for CUDA {torch.version.cuda}; rebuild with IMAGE_PRUNING_WHEEL_VARIANT "
+        "set accordingly, for example cu129 for CUDA 12 or cu130 for CUDA 13."
     ) from exc
 if not hasattr(torch.ops._moe_C, "topk_softmax"):
     raise SystemExit(
