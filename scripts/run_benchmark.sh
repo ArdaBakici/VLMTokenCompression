@@ -21,6 +21,7 @@ SERVER_BACKEND="${SERVER_BACKEND:-vllm}"
 IMAGE_PRUNING_RATE="${IMAGE_PRUNING_RATE:-0.3}"
 VIT_ATTENTION_SCORE_LAYER_INDEX="${VIT_ATTENTION_SCORE_LAYER_INDEX:--2}"
 IMAGE_PRUNING_ENCODER_PATCH="${IMAGE_PRUNING_ENCODER_PATCH:-1}"
+IMAGE_PRUNING_GLIBC_SHIM="${IMAGE_PRUNING_GLIBC_SHIM:-0}"
 CROSSVID_REPOSITORY="https://github.com/chuntianli666/CrossVid.git"
 CROSSVID_COMMIT="b53ada63551f9ac4a726b381b627d17ece066281"
 CROSSVID_VENDOR_ROOT="${CROSSVID_VENDOR_ROOT:-$PROJECT_DIR/vendor/CrossVid}"
@@ -61,20 +62,24 @@ case "$SERVER_BACKEND" in
             printf '  %s\n' "${image_pruning_models[@]}" >&2
             exit 2
         fi
-        # MoE checkpoints route through vllm/_moe_C.abi3.so, which the precompiled
-        # manylinux_2_31 wheel builds against glibc 2.31. Dense checkpoints never
-        # load that extension and keep working on older hosts, so this is checked
-        # per model rather than for the whole profile.
+        # MoE checkpoints route through vllm/_moe_C.abi3.so, built by the
+        # precompiled manylinux_2_31 wheel. Dense checkpoints never load that
+        # extension and keep working on older hosts, so this is checked per
+        # model rather than for the whole profile. IMAGE_PRUNING_GLIBC_SHIM
+        # relaxes the check because the extension's only requirement above
+        # glibc 2.14 is log2@GLIBC_2.29; see the shim below.
         image_pruning_moe_models=("Qwen/Qwen3-VL-30B-A3B-Instruct")
         host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
         if [[ " ${image_pruning_moe_models[*]} " == *" $MODEL "* && -n "$host_glibc" ]] \
+            && [[ "$IMAGE_PRUNING_GLIBC_SHIM" != "1" ]] \
             && [[ "$(printf '%s\n2.31\n' "$host_glibc" | sort --version-sort | head -n 1)" != "2.31" ]]; then
             printf '%s\n' \
                 "This host provides glibc $host_glibc, but the precompiled vLLM" \
-                'wheel needs 2.31 or newer for its MoE extension. Dense' \
-                'checkpoints do not load that extension and still run here.' \
-                'Run the MoE checkpoint on a newer node or inside a container,' \
-                'or benchmark a dense checkpoint on this one.' >&2
+                'wheel needs 2.31 or newer for its MoE extension. Its only' \
+                'requirement above glibc 2.14 is the symbol log2@GLIBC_2.29,' \
+                'which every glibc also provides as log2@GLIBC_2.2.5. Rebind it' \
+                'with IMAGE_PRUNING_GLIBC_SHIM=1, or run the MoE checkpoint on a' \
+                'newer node or inside a container.' >&2
             exit 2
         fi
         if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
@@ -190,6 +195,36 @@ else
 fi
 
 if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    # The MoE extension in the precompiled manylinux_2_31 wheel imports exactly
+    # one symbol above glibc 2.14: log2@GLIBC_2.29. glibc has also exported
+    # log2@GLIBC_2.2.5 since 2.2.5, and the 2.29 entry is a faster
+    # implementation of the same function, so clearing the version requirement
+    # binds it to an implementation every host already has. This is what makes
+    # MoE checkpoints usable below glibc 2.31.
+    GLIBC_SHIM="none"
+    if [[ "$IMAGE_PRUNING_GLIBC_SHIM" == "1" ]]; then
+        if ! command -v patchelf >/dev/null 2>&1; then
+            printf '%s\n' \
+                'IMAGE_PRUNING_GLIBC_SHIM=1 requires patchelf. Install it with:' \
+                "  conda install --yes --prefix $CONDA_ENV --channel conda-forge patchelf" >&2
+            exit 2
+        fi
+        moe_extension="$("$CONDA_ENV/bin/python" - <<'PY'
+import pathlib
+
+import vllm
+
+extensions = sorted(pathlib.Path(vllm.__file__).parent.glob("_moe_C*.so"))
+if not extensions:
+    raise SystemExit("The installed vLLM has no MoE extension to rebind")
+print(extensions[0])
+PY
+        )"
+        patchelf --clear-symbol-version log2 "$moe_extension"
+        printf 'Rebound log2 to its base version in %s\n' "$moe_extension"
+        GLIBC_SHIM="glibc-log2-downgrade-v1"
+    fi
+
     VLLM_VERSION="$("$CONDA_ENV/bin/python" - \
         "$IMAGE_PRUNING_RATE" "$VIT_ATTENTION_SCORE_LAYER_INDEX" <<'PY'
 from importlib.metadata import version
@@ -264,7 +299,7 @@ PY
             'vision tower, and MoE checkpoints fail on their first image.' >&2
     fi
 
-    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;variant=$IMAGE_PRUNING_WHEEL_VARIANT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH"
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;variant=$IMAGE_PRUNING_WHEEL_VARIANT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH;glibc-shim=$GLIBC_SHIM"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -415,6 +450,7 @@ if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
         "$VIT_ATTENTION_SCORE_LAYER_INDEX" \
         "$MODEL" \
         "$ENCODER_PATCH" \
+        "$GLIBC_SHIM" \
         "${vllm_command[@]:4}" <<'PY'
 import json
 import os
@@ -435,7 +471,8 @@ expected = {
     "model": sys.argv[10],
     "tensor_parallel_size": 1,
     "encoder_patch": sys.argv[11],
-    "server_arguments": sys.argv[12:],
+    "glibc_shim": sys.argv[12],
+    "server_arguments": sys.argv[13:],
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))

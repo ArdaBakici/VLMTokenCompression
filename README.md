@@ -354,16 +354,39 @@ isolated build. On a host whose driver reports CUDA 13 that would install `cu130
 extensions beside a CUDA 12 torch. Override it only to match a different pinned
 torch, and rebuild the environment when you change it.
 
-The glibc floor is enforced per model. `vllm/_moe_C.abi3.so` references symbols
-versioned `GLIBC_2.29`, so on a host below the wheel's manylinux_2_31 baseline it
+The glibc floor is enforced per model. `vllm/_moe_C.abi3.so` imports
+`log2@GLIBC_2.29`, so on a host below the wheel's manylinux_2_31 baseline it
 fails to load while `vllm/_C.abi3.so` still does. vLLM logs that failed import
 and carries on, so a dense checkpoint serves normally and a MoE checkpoint dies
 minutes later during memory profiling with
 `'_OpNamespace' '_moe_C' object has no attribute 'topk_softmax'`. The launcher
 rejects a MoE checkpoint up front when `getconf GNU_LIBC_VERSION` reports less
 than 2.31, and separately imports the extension after synchronizing so any other
-load failure is reported before the server starts. Run MoE checkpoints on a node
-that meets the baseline or inside a container; dense checkpoints are unaffected.
+load failure is reported before the server starts. Dense checkpoints are
+unaffected.
+
+That single symbol is the whole floor: apart from it the extension needs nothing
+above glibc 2.14. `log2` has been exported as `log2@GLIBC_2.2.5` since glibc
+2.2.5, and 2.29 added a faster implementation of the same function under a new
+version tag. `IMAGE_PRUNING_GLIBC_SHIM=1` runs
+`patchelf --clear-symbol-version log2` against the installed extension, which
+rebinds it to the base version present on every host, and relaxes the launcher's
+glibc check:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+IMAGE_PRUNING_GLIBC_SHIM=1 \
+  scripts/run_mmiu_image_pruning.sh Qwen/Qwen3-VL-30B-A3B-Instruct
+```
+
+It needs `patchelf`, which the launcher tells you how to install if it is
+missing, and it is recorded as `glibc_shim` in `server-config.json` and in the
+MMIU backend signature. Report it with the other local modifications. The two
+implementations of `log2` differ only in accuracy at the last bit and in errno
+handling, and the MoE extension uses it for kernel sizing rather than for model
+arithmetic, but it is a local change to a compiled artifact and belongs in the
+provenance record. Running on a host that meets the baseline, or in a container,
+avoids it entirely.
 
 Each compressed run records `server-config.json` in its result directory.
 Resuming with a different model, pruning rate, attention layer, backend, source
