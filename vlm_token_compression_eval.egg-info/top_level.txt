@@ -1,5 +1,7 @@
+compression_profiles
 crossvid_eval
 crossvid_score
 efficiency_metrics
 mmiu_eval
 model_profiles
+official_compression_server

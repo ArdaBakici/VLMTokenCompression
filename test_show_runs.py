@@ -66,7 +66,9 @@ class ProfileTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual(profile(run, {"model": "m"}), "prune=0.3 layer=-2 glibc-shim")
+            self.assertEqual(
+                profile(run, {"model": "m"}), "prune=0.3 layer=-2 glibc-shim"
+            )
 
     def test_calls_a_run_without_a_server_config_baseline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -81,6 +83,23 @@ class ProfileTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(profile(run, {"model": "m"}), "baseline internvl")
+
+    def test_names_official_compression_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "server-config.json").write_text(
+                json.dumps(
+                    {
+                        "compression_method": "visionzip",
+                        "parameters": {"dominant_tokens": 54, "contextual_tokens": 10},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                profile(run, {"model": "m"}),
+                "visionzip contextual_tokens=10 dominant_tokens=54",
+            )
 
 
 class MmiuSummaryTest(unittest.TestCase):

@@ -415,6 +415,82 @@ Add `--json` for machine-readable output. The `profile` column comes from each
 run's `server-config.json`, so compressed runs report their pruning rate,
 attention layer and any local patches alongside the score.
 
+## Official Compression Methods
+
+Five training-free methods can be evaluated through their pinned official model
+implementations:
+
+| Method | Official source commit | Compatible checkpoint | Default setting |
+| --- | --- | --- | --- |
+| VisionZip | `8f86b55c6f000eb033e6912538af2dd7dcb30502` | `liuhaotian/llava-v1.5-7b@4481d270` | 54 dominant + 10 contextual tokens |
+| HiPrune | `82781005a7e72a6be9ede58fd77473efa72b5e4f` | `liuhaotian/llava-v1.5-7b@4481d270` | 192 retained, alpha 0.1, object layer 9 |
+| CDPruner | `9541616c40fcd5625de1cdb8ea6c33c129eb7864` | `liuhaotian/llava-v1.5-7b@4481d270` | 64 retained tokens |
+| DivPrune | `799e2d950aa01ba7860907f5a6d86061f885dca6` | `liuhaotian/llava-v1.5-7b@4481d270` | 9.8% retained at layer 0 |
+| FastV | `d1659729b5bf1be225e99ee15783deeea80f63b1` | `llava-hf/llava-1.5-7b-hf@a272c74` | layer 3, 75% pruned |
+
+Run one method with:
+
+```bash
+scripts/run_mmiu_compression.sh visionzip
+scripts/run_mmiu_compression.sh hiprune
+scripts/run_mmiu_compression.sh cdpruner
+scripts/run_mmiu_compression.sh divprune
+scripts/run_mmiu_compression.sh fastv
+```
+
+Each method receives a separate persistent Conda prefix named
+`official-METHOD-COMMIT`. The launcher clones and verifies the exact source
+commit, installs its incompatible legacy model fork in that prefix, starts the
+shared OpenAI-compatible adapter, and runs the normal resumable MMIU evaluator.
+Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` after the environment has been installed.
+
+The released implementations are batch-one, single-image LLaVA paths. The
+launcher therefore sets `--workers 1` by default and evaluates only MMIU rows
+with at most one image. The filter is stored in the manifest and these results
+must be reported as **single-image MMIU subset scores**, never full MMIU scores.
+CrossVid is not supported because it sends multiple sampled frames. The methods
+are also not relabeled as implementations for Qwen3-VL, InternVL3, or the HF
+LLaVA-NeXT-Mistral checkpoint; paper-reported ports without released code are not
+silently reconstructed.
+
+Override the official settings with environment variables:
+
+```bash
+VISIONZIP_DOMINANT_TOKENS=108 VISIONZIP_CONTEXTUAL_TOKENS=20 \
+  scripts/run_mmiu_compression.sh visionzip
+
+HIPRUNE_RETENTION=128 HIPRUNE_ALPHA=0.1 HIPRUNE_OBJECT_LAYER=9 \
+  scripts/run_mmiu_compression.sh hiprune
+
+CDPRUNER_RETAINED_TOKENS=128 \
+  scripts/run_mmiu_compression.sh cdpruner
+
+DIVPRUNE_RETAINED_RATIO=0.2 \
+  scripts/run_mmiu_compression.sh divprune
+
+FASTV_K=2 FASTV_R=0.5 \
+  scripts/run_mmiu_compression.sh fastv
+```
+
+Parameters are validated against each released implementation and recorded in
+`server-config.json` and the evaluator backend signature. The adapter exposes
+the nominal measured boundary as `visual_tokens_before` and
+`visual_tokens_after`: 576 initial LLaVA-1.5 patch tokens and the configured
+retained budget. FastV is different from the other four: all 576 tokens enter
+the early decoder layers and only later layers see the retained count, so API
+prompt usage remains uncompressed.
+
+VisionZip, HiPrune, CDPruner, and FastV use Apache-2.0 code. DivPrune's official
+repository is CC BY-NC 4.0; do not use that backend commercially. The official
+repositories do not provide mutually consistent lockfiles, so the adapter pins
+their source commits and central legacy requirements, and records the resulting
+environment separately from the vLLM environments.
+
+MMIU must already be prepared under `MMIU_ROOT`. Existing baseline setup does
+this automatically. Use `MMIU_TASKS` and `MMIU_LIMIT` to select a smaller
+single-image experiment. Result comparison still requires identical selected
+indices and generation settings.
+
 ## Experimental Image Pruning
 
 The repository includes an opt-in MMIU profile for the attention-based image

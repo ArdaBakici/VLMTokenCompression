@@ -9,6 +9,7 @@ from mmiu_eval import (
     parse_choice,
     reparse_records,
     score_records,
+    selected_indices,
     validate_model_coverage,
 )
 
@@ -90,6 +91,26 @@ class PromptTest(unittest.TestCase):
     def test_defaults_to_context_first(self):
         row = {"task": "other", "question": "question", "context": "context"}
         self.assertTrue(build_prompt(row).startswith("context\nquestion"))
+
+
+class SelectionTest(unittest.TestCase):
+    def test_filters_by_image_count_before_applying_limit(self):
+        dataset = (
+            {"task": "task", "input_image_path": ["a", "b"]},
+            {"task": "task", "input_image_path": ["a"]},
+            {"task": "task", "input_image_path": ["a"]},
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "tasks": None,
+                "start": 0,
+                "limit": 1,
+                "max_images_per_example": 1,
+            },
+        )()
+        self.assertEqual(selected_indices(dataset, args), [1])
 
 
 class ScoringTest(unittest.TestCase):

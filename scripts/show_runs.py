@@ -45,9 +45,18 @@ def profile(run: Path, manifest: dict[str, Any]) -> str:
     config = read_json(run / SERVER_CONFIG)
     if not config:
         return "baseline" if manifest else "unknown"
+    method = config.get("compression_method")
+    if method:
+        parameters = config.get("parameters", {})
+        values = " ".join(f"{key}={value}" for key, value in sorted(parameters.items()))
+        return f"{method} {values}".strip()
     if "image_pruning_rate" not in config:
         family = config.get("model_family")
-        return f"baseline {family}" if family not in {None, "qwen", "generic"} else "baseline"
+        return (
+            f"baseline {family}"
+            if family not in {None, "qwen", "generic"}
+            else "baseline"
+        )
     parts = [f"prune={config.get('image_pruning_rate', '?')}"]
     layer = config.get("vit_attention_score_layer_index")
     if layer is not None:
@@ -119,7 +128,9 @@ def crossvid_summary(summary_path: Path) -> dict[str, Any]:
         "benchmark": "crossvid",
         "run": summary_path.parent,
         "model": crossvid_model(summary_path.parent),
-        "profile": profile(summary_path.parent, {"model": crossvid_model(summary_path.parent)}),
+        "profile": profile(
+            summary_path.parent, {"model": crossvid_model(summary_path.parent)}
+        ),
         "rows": sum(counts.values()),
         "missing": 0,
         "unexpected": 0,
@@ -146,7 +157,9 @@ def collect(root: Path, dataset: Any) -> list[dict[str, Any]]:
     ]
     if not summaries:
         raise SystemExit(f"No completed runs found under {root}")
-    return sorted(summaries, key=lambda row: (row["benchmark"], row["model"], row["run"]))
+    return sorted(
+        summaries, key=lambda row: (row["benchmark"], row["model"], row["run"])
+    )
 
 
 def cell(text: str, width: int) -> str:
@@ -207,7 +220,9 @@ def print_table(summaries: list[dict[str, Any]], root: Path) -> None:
             note += f" (recorded {recorded:.2f} before re-parsing)"
         flags = []
         if row["missing"] or row["unexpected"]:
-            flags.append(f"{row['missing']} missing, {row['unexpected']} unexpected rows")
+            flags.append(
+                f"{row['missing']} missing, {row['unexpected']} unexpected rows"
+            )
         if row["failures"]:
             flags.append(f"{row['failures']} API failures counted as incorrect")
         if flags:
@@ -243,9 +258,7 @@ def main() -> None:
     summaries = collect(args.results, dataset)
     if args.json:
         print(
-            json.dumps(
-                [{**row, "run": str(row["run"])} for row in summaries], indent=2
-            )
+            json.dumps([{**row, "run": str(row["run"])} for row in summaries], indent=2)
         )
         return
     print_table(summaries, args.results)

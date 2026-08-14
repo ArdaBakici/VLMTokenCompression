@@ -1,0 +1,15 @@
+accelerate==0.21.0
+bitsandbytes==0.41.1
+einops==0.6.1
+einops-exts==0.0.4
+numpy<2
+peft==0.4.0
+pillow>=10,<12
+protobuf>=4,<6
+sentencepiece==0.1.99
+shortuuid==1.0.13
+timm==0.6.13
+tokenizers==0.15.1
+torch==2.1.2
+torchvision==0.16.2
+transformers==4.37.2

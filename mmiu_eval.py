@@ -258,7 +258,11 @@ def selected_indices(dataset: Any, args: argparse.Namespace) -> list[int]:
     selected = [
         index
         for index in indices
-        if not allowed_tasks or dataset[index]["task"] in allowed_tasks
+        if (not allowed_tasks or dataset[index]["task"] in allowed_tasks)
+        and (
+            getattr(args, "max_images_per_example", None) is None
+            or len(dataset[index]["input_image_path"]) <= args.max_images_per_example
+        )
     ]
     if allowed_tasks and not selected:
         raise SystemExit("--tasks did not match any stored task values")
@@ -338,6 +342,7 @@ def run(args: argparse.Namespace) -> None:
         "image_transport": args.image_transport,
         "enable_thinking": args.enable_thinking,
         "max_tokens": args.max_tokens,
+        "max_images_per_example": args.max_images_per_example,
         "stream": True,
         "efficiency_schema_version": EFFICIENCY_SCHEMA_VERSION,
         "workers": args.workers,
@@ -443,7 +448,9 @@ def score_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def reparse_records(records: list[dict[str, Any]], dataset: Any) -> list[dict[str, Any]]:
+def reparse_records(
+    records: list[dict[str, Any]], dataset: Any
+) -> list[dict[str, Any]]:
     """Recompute choices from stored predictions with the current extractor.
 
     Answer extraction is deterministic, so a fixed extractor can be applied to
@@ -511,7 +518,9 @@ def print_score(output: Path, strict: bool, dataset: Any = None) -> None:
     if efficiency["measured_records"]:
         print(format_efficiency_summary(efficiency))
     if strict and (missing or unexpected or score["failures"]):
-        raise SystemExit("Strict scoring failed because the run is invalid or incomplete")
+        raise SystemExit(
+            "Strict scoring failed because the run is invalid or incomplete"
+        )
 
 
 def score_command(args: argparse.Namespace) -> None:
@@ -552,9 +561,7 @@ def parser() -> argparse.ArgumentParser:
         "run", help="run model inference and strict scoring"
     )
     run_parser.add_argument("--model", required=True)
-    run_parser.add_argument(
-        "--model-family", choices=MODEL_FAMILIES, default="auto"
-    )
+    run_parser.add_argument("--model-family", choices=MODEL_FAMILIES, default="auto")
     run_parser.add_argument("--media-root", required=True, type=Path)
     run_parser.add_argument("--output", required=True, type=Path)
     run_parser.add_argument("--dataset-path", help="optional local all.parquet path")
@@ -571,6 +578,7 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-tokens", type=int, default=16)
     run_parser.add_argument("--start", type=int, default=0)
     run_parser.add_argument("--limit", type=int)
+    run_parser.add_argument("--max-images-per-example", type=int)
     run_parser.add_argument("--tasks", help="comma-separated task names")
     run_parser.add_argument(
         "--image-transport", choices=("data-uri", "file-url"), default="data-uri"
@@ -603,6 +611,11 @@ def main() -> None:
         raise SystemExit("--limit must not be negative")
     if getattr(args, "max_tokens", 1) < 1:
         raise SystemExit("--max-tokens must be at least 1")
+    if (
+        getattr(args, "max_images_per_example", None) is not None
+        and args.max_images_per_example < 1
+    ):
+        raise SystemExit("--max-images-per-example must be at least 1")
     args.function(args)
 
 
