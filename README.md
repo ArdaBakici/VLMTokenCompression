@@ -79,12 +79,35 @@ scripts/run_mmiu.sh llava-hf/llava-v1.6-mistral-7b-hf
 Only the native `OpenGVLab/InternVL3-8B-hf` format is supported. The original
 remote-code checkpoint does not ship a vLLM-compatible chat template.
 
-LLaVA-NeXT supports MMIU smoke tests and subsets, but not a strict full MMIU
-score: the released benchmark contains rows with up to 62 images and AnyRes
-visual-token expansion depends on image dimensions. The evaluator applies a
-conservative eight-image ceiling derived from the checkpoint's largest configured
-AnyRes grid, rejects a selected subset containing larger rows before inference,
-and identifies their indices. Report any filtered run as reduced coverage.
+### LLaVA-NeXT Context Budget
+
+MMIU rows carry up to 62 images, and LLaVA-NeXT AnyRes expands each image to
+between 1,176 and 2,928 prompt tokens depending on its pixel dimensions: a
+336x336 image selects the 336x672 grid and costs 1,176 tokens, while any image
+512x512 or larger selects 672x672 and costs 2,928. Image count alone therefore
+does not determine whether a row fits; sixteen small images need 18,816 tokens
+and fit a 32K context, while sixteen large ones need 46,848 and do not.
+
+Before inference the evaluator reproduces the Transformers
+`LlavaNextProcessor` calculation exactly, reading image headers to obtain each
+row's real visual length, and adds a conservative text estimate, chat-template
+overhead, and the `--max-tokens` output allowance. Rows are compared against
+`--max-model-len`, which the launcher passes from the value used to start the
+server. Only rows whose outcome is not already settled by the per-image bounds
+are measured, so most of the dataset needs no image reads.
+
+A run stops when selected rows do not fit, listing their measured lengths:
+
+```bash
+uv run mmiu-eval run ... --max-model-len 32768 --skip-oversized-rows
+```
+
+`--skip-oversized-rows` evaluates the rows that fit and records the decision in
+the manifest. It also prints task coverage, because dropped rows can remove
+whole MMIU tasks from the unweighted macro average, which then covers fewer than
+60 tasks. Report such a run as reduced coverage rather than an MMIU score, and
+compare only runs whose manifests list the same indices. `MMIU_SKIP_OVERSIZED=1`
+sets the flag through `scripts/run_mmiu.sh`.
 
 ## MMIU Data
 

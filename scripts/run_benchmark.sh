@@ -667,10 +667,14 @@ case "$BENCHMARK" in
             --output "$RUN_DIR/results.jsonl"
             --workers "$WORKERS"
             --model-family "$MODEL_FAMILY"
+            --max-model-len "$MAX_MODEL_LEN"
             --backend-signature "$BACKEND_SIGNATURE"
         )
         if [[ -n "${MMIU_LIMIT:-}" ]]; then
             mmiu_arguments+=(--limit "$MMIU_LIMIT")
+        fi
+        if [[ "${MMIU_SKIP_OVERSIZED:-0}" == "1" ]]; then
+            mmiu_arguments+=(--skip-oversized-rows)
         fi
         "$UV_BIN" run --no-sync mmiu-eval run "${mmiu_arguments[@]}"
         ;;

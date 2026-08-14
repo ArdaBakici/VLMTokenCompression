@@ -1,3 +1,4 @@
+import argparse
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,10 +8,11 @@ from mmiu_eval import (
     ensure_manifest,
     option_labels,
     parse_choice,
+    partition_by_context,
     reparse_records,
+    row_prompt_tokens,
     score_records,
     selected_indices,
-    validate_model_coverage,
 )
 
 
@@ -188,24 +190,85 @@ class ManifestTest(unittest.TestCase):
                     ensure_manifest(output, resumed)
 
 
-class ModelCoverageTest(unittest.TestCase):
-    def test_rejects_llava_rows_that_cannot_fit_the_32k_context(self):
-        dataset = (
-            {"input_image_path": ["image.jpg"] * 57},
-            {"input_image_path": ["image.jpg"]},
+class ContextBudgetTest(unittest.TestCase):
+    """Rows are measured against the real AnyRes expansion, not an image cap."""
+
+    def write_dataset(self, directory, sizes):
+        from PIL import Image
+
+        rows = []
+        for row_index, row_sizes in enumerate(sizes):
+            paths = []
+            for image_index, (height, width) in enumerate(row_sizes):
+                name = f"{row_index}-{image_index}.png"
+                Image.new("RGB", (width, height)).save(directory / name)
+                paths.append(name)
+            rows.append(
+                {
+                    "task": "task",
+                    "question": "Question?",
+                    "context": "",
+                    "input_image_path": paths,
+                }
+            )
+        return rows
+
+    def arguments(self, directory, max_model_len):
+        return argparse.Namespace(
+            model_family="llava-next",
+            media_root=directory,
+            max_tokens=16,
+            max_model_len=max_model_len,
         )
-        with self.assertRaisesRegex(SystemExit, "57 images"):
-            validate_model_coverage(dataset, [0, 1], "llava-next")
 
-    def test_accepts_a_supported_llava_subset_and_other_families(self):
-        dataset = ({"input_image_path": ["image.jpg"] * 8},)
-        validate_model_coverage(dataset, [0], "llava-next")
-        validate_model_coverage(dataset, [0], "qwen")
+    def test_small_images_keep_rows_a_fixed_image_cap_would_reject(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            # Sixteen 336x336 images expand to 1,176 tokens each: 18,816 in
+            # total, which fits the 32K context an image cap would have refused.
+            dataset = self.write_dataset(directory, [[(336, 336)] * 16])
 
-    def test_rejects_llava_anyres_rows_above_the_conservative_limit(self):
-        dataset = ({"input_image_path": ["image.jpg"] * 9},)
-        with self.assertRaisesRegex(SystemExit, "9 images"):
-            validate_model_coverage(dataset, [0], "llava-next")
+            fitting, oversized = partition_by_context(
+                dataset, [0], self.arguments(directory, 32768)
+            )
+
+            self.assertEqual(fitting, [0])
+            self.assertEqual(oversized, [])
+
+    def test_large_images_are_rejected_with_their_measured_length(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            # The same count of 512x512 images costs 2,928 tokens each.
+            dataset = self.write_dataset(directory, [[(512, 512)] * 16])
+
+            fitting, oversized = partition_by_context(
+                dataset, [0], self.arguments(directory, 32768)
+            )
+
+            self.assertEqual(fitting, [])
+            self.assertEqual(len(oversized), 1)
+            index, tokens = oversized[0]
+            self.assertEqual(index, 0)
+            self.assertGreater(tokens, 32768)
+
+    def test_other_families_are_never_filtered(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            dataset = self.write_dataset(directory, [[(512, 512)] * 16])
+            args = self.arguments(directory, 32768)
+            args.model_family = "qwen"
+
+            self.assertEqual(partition_by_context(dataset, [0], args), ([0], []))
+
+    def test_prompt_length_includes_text_and_output_allowance(self):
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            dataset = self.write_dataset(directory, [[(336, 336)]])
+
+            tokens = row_prompt_tokens(dataset[0], directory, max_tokens=16)
+
+            self.assertGreater(tokens, 1176)
+            self.assertLess(tokens, 1176 + 400)
 
 
 if __name__ == "__main__":

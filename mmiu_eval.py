@@ -26,15 +26,24 @@ from efficiency_metrics import (
 from model_profiles import (
     MODEL_FAMILIES,
     chat_template_extra_body,
+    llava_next_image_tokens,
     resolve_model_family,
 )
 
 DATASET_ID = "FanqingM/MMIU-Benchmark"
 DATASET_REVISION = "03bf7d143d920e97a757f606b6b7baee161b019b"
-# The checkpoint's largest AnyRes grid uses four crops plus the base image,
-# each contributing roughly one 24x24 patch grid. Eight images leave room in
-# the 32K context for image newlines, question text, and generation.
-LLAVA_NEXT_MAX_MMIU_IMAGES = 8
+# Bounds on one LLaVA-NeXT image, used only to skip measuring rows whose answer
+# is already certain. The maximum is the 672x672 grid with no unpadding; the
+# minimum is the base image alone, because unpadded and newline features are
+# never negative. Both are asserted against the exact formula in the tests.
+LLAVA_NEXT_MAX_IMAGE_TOKENS = 2928
+LLAVA_NEXT_MIN_IMAGE_TOKENS = 577
+# MMIU prompt text is estimated conservatively: English averages closer to four
+# characters per token, so three overestimates the text and never lets an
+# oversized row through.
+TEXT_CHARS_PER_TOKEN = 3
+# Chat template scaffolding around the single user turn.
+PROMPT_OVERHEAD_TOKENS = 48
 
 # The official inference script puts the question before the context for these tasks.
 QUESTION_FIRST_TASKS = {
@@ -269,29 +278,93 @@ def selected_indices(dataset: Any, args: argparse.Namespace) -> list[int]:
     return selected[: args.limit] if args.limit is not None else selected
 
 
-def validate_model_coverage(
-    dataset: Any, indices: list[int], model_family: str
-) -> None:
-    if model_family != "llava-next":
-        return
-    oversized = [
-        index
-        for index in indices
-        if len(dataset[index]["input_image_path"]) > LLAVA_NEXT_MAX_MMIU_IMAGES
-    ]
-    if oversized:
-        examples = ", ".join(
-            f"{index} ({len(dataset[index]['input_image_path'])} images)"
-            for index in oversized[:5]
+def image_size(path: Path) -> tuple[int, int]:
+    """Return (height, width) by reading the image header only."""
+
+    from PIL import Image
+
+    with Image.open(path) as image:
+        width, height = image.size
+    return height, width
+
+
+def row_prompt_tokens(row: dict[str, Any], media_root: Path, max_tokens: int) -> int:
+    """Exact LLaVA-NeXT prompt length for one MMIU row."""
+
+    visual = sum(
+        llava_next_image_tokens(*image_size(resolve_image(media_root, stored)))
+        for stored in row["input_image_path"]
+    )
+    text = -(-len(build_prompt(row)) // TEXT_CHARS_PER_TOKEN)
+    return visual + text + PROMPT_OVERHEAD_TOKENS + max_tokens
+
+
+def partition_by_context(
+    dataset: Any, indices: list[int], args: argparse.Namespace
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Split selected rows into those that fit the context and those that do not.
+
+    Rows whose outcome is already decided by the per-image bounds are not
+    measured, so only genuinely ambiguous rows read image headers.
+    """
+
+    if args.model_family != "llava-next":
+        return indices, []
+
+    fitting = []
+    oversized = []
+    for index in indices:
+        row = dataset[index]
+        count = len(row["input_image_path"])
+        fixed = (
+            -(-len(build_prompt(row)) // TEXT_CHARS_PER_TOKEN)
+            + PROMPT_OVERHEAD_TOKENS
+            + args.max_tokens
         )
-        raise SystemExit(
-            "LLaVA-NeXT cannot fit every selected MMIU row in its 32K context. "
-            f"At least {len(oversized)} selected rows exceed the safe "
-            f"{LLAVA_NEXT_MAX_MMIU_IMAGES}-image AnyRes limit, which reserves "
-            f"context for question text and output; first: {examples}. Use "
-            "--start/--limit/--tasks for a supported "
-            "subset and report reduced coverage; a strict full MMIU score is not "
-            "available for this checkpoint."
+        if count * LLAVA_NEXT_MAX_IMAGE_TOKENS + fixed <= args.max_model_len:
+            fitting.append(index)
+            continue
+        if count * LLAVA_NEXT_MIN_IMAGE_TOKENS + fixed > args.max_model_len:
+            oversized.append((index, count * LLAVA_NEXT_MIN_IMAGE_TOKENS + fixed))
+            continue
+        tokens = row_prompt_tokens(row, args.media_root, args.max_tokens)
+        if tokens <= args.max_model_len:
+            fitting.append(index)
+        else:
+            oversized.append((index, tokens))
+    return fitting, oversized
+
+
+def report_coverage(
+    dataset: Any, kept: list[int], oversized: list[tuple[int, int]]
+) -> None:
+    """Explain which tasks a context-filtered run can still score."""
+
+    kept_by_task: dict[str, int] = defaultdict(int)
+    dropped_by_task: dict[str, int] = defaultdict(int)
+    for index in kept:
+        kept_by_task[dataset[index]["task"]] += 1
+    for index, _ in oversized:
+        dropped_by_task[dataset[index]["task"]] += 1
+
+    tasks = set(kept_by_task) | set(dropped_by_task)
+    complete = sum(1 for task in tasks if not dropped_by_task[task])
+    partial = sum(1 for task in tasks if kept_by_task[task] and dropped_by_task[task])
+    lost = sum(1 for task in tasks if not kept_by_task[task])
+    total = len(kept) + len(oversized)
+    print(
+        f"Context coverage: {len(kept)}/{total} rows fit | tasks complete={complete} "
+        f"partial={partial} dropped={lost}"
+    )
+    examples = ", ".join(
+        f"{index} ({len(dataset[index]['input_image_path'])} images, ~{tokens} tokens)"
+        for index, tokens in oversized[:5]
+    )
+    print(f"Rows exceeding the context: {len(oversized)}; first: {examples}")
+    if lost or partial:
+        print(
+            "The macro average will cover fewer tasks than full MMIU. Report this "
+            "as reduced coverage, not as an MMIU score."
         )
 
 
@@ -328,7 +401,18 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc)) from exc
     dataset = load_mmiu(args.dataset_path)
     indices = selected_indices(dataset, args)
-    validate_model_coverage(dataset, indices, args.model_family)
+    indices, oversized = partition_by_context(dataset, indices, args)
+    if oversized:
+        report_coverage(dataset, indices, oversized)
+        if not args.skip_oversized_rows:
+            raise SystemExit(
+                f"{len(oversized)} selected rows exceed --max-model-len "
+                f"{args.max_model_len} for this checkpoint. Rerun with "
+                "--skip-oversized-rows to evaluate the rows that fit and record "
+                "the reduced coverage in the manifest, raise --max-model-len if "
+                "the server allows it, or narrow the subset with "
+                "--start/--limit/--tasks."
+            )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "dataset": DATASET_ID,
@@ -343,6 +427,8 @@ def run(args: argparse.Namespace) -> None:
         "enable_thinking": args.enable_thinking,
         "max_tokens": args.max_tokens,
         "max_images_per_example": args.max_images_per_example,
+        "max_model_len": args.max_model_len,
+        "skip_oversized_rows": args.skip_oversized_rows,
         "stream": True,
         "efficiency_schema_version": EFFICIENCY_SCHEMA_VERSION,
         "workers": args.workers,
@@ -579,6 +665,18 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--start", type=int, default=0)
     run_parser.add_argument("--limit", type=int)
     run_parser.add_argument("--max-images-per-example", type=int)
+    run_parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=32768,
+        help="Server context length used to decide whether a row's prompt fits.",
+    )
+    run_parser.add_argument(
+        "--skip-oversized-rows",
+        action="store_true",
+        help="Evaluate only the rows that fit the context and record the "
+        "reduced coverage in the manifest.",
+    )
     run_parser.add_argument("--tasks", help="comma-separated task names")
     run_parser.add_argument(
         "--image-transport", choices=("data-uri", "file-url"), default="data-uri"
@@ -616,6 +714,8 @@ def main() -> None:
         and args.max_images_per_example < 1
     ):
         raise SystemExit("--max-images-per-example must be at least 1")
+    if getattr(args, "max_model_len", 1) < 1:
+        raise SystemExit("--max-model-len must be at least 1")
     args.function(args)
 
 
