@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from efficiency_metrics import summarize_efficiency
 from mmiu_eval import (
     latest_by_index,
     manifest_path,
@@ -44,6 +45,9 @@ def profile(run: Path, manifest: dict[str, Any]) -> str:
     config = read_json(run / SERVER_CONFIG)
     if not config:
         return "baseline" if manifest else "unknown"
+    if "image_pruning_rate" not in config:
+        family = config.get("model_family")
+        return f"baseline {family}" if family not in {None, "qwen", "generic"} else "baseline"
     parts = [f"prune={config.get('image_pruning_rate', '?')}"]
     layer = config.get("vit_attention_score_layer_index")
     if layer is not None:
@@ -70,6 +74,7 @@ def mmiu_summary(results: Path, dataset: Any) -> dict[str, Any]:
         reparsed = score_records(reparse_records(records, dataset))
 
     score = reparsed or stored
+    efficiency = stored["efficiency"]
     return {
         "benchmark": "mmiu",
         "run": results.parent,
@@ -83,6 +88,7 @@ def mmiu_summary(results: Path, dataset: Any) -> dict[str, Any]:
         "score": score["macro_accuracy"] * 100,
         "recorded_score": stored["macro_accuracy"] * 100 if reparsed else None,
         "metric": "macro",
+        "efficiency": efficiency,
     }
 
 
@@ -102,19 +108,27 @@ def crossvid_model(run: Path) -> str:
 def crossvid_summary(summary_path: Path) -> dict[str, Any]:
     summary = read_json(summary_path)
     counts = summary.get("counts", {})
+    latest = {}
+    for state in sorted((summary_path.parent / ".state").glob("*_run.jsonl")):
+        task = state.name.removesuffix("_run.jsonl")
+        for record in read_jsonl(state):
+            latest[(task, str(record["id"]))] = record
+    failures = sum(not record.get("success") for record in latest.values())
+    invalid = sum(record.get("parse_error", False) for record in latest.values())
     return {
         "benchmark": "crossvid",
         "run": summary_path.parent,
         "model": crossvid_model(summary_path.parent),
-        "profile": "baseline",
+        "profile": profile(summary_path.parent, {"model": crossvid_model(summary_path.parent)}),
         "rows": sum(counts.values()),
         "missing": 0,
         "unexpected": 0,
-        "failures": 0,
-        "invalid": 0,
+        "failures": failures,
+        "invalid": invalid,
         "score": summary.get("averages", {}).get("O.Avg", 0.0) * 100,
         "recorded_score": None,
         "metric": "O.Avg",
+        "efficiency": summarize_efficiency(list(latest.values())),
     }
 
 
@@ -149,6 +163,9 @@ def print_table(summaries: list[dict[str, Any]], root: Path) -> None:
         ("rows", "rows", 6),
         ("failures", "fail", 5),
         ("invalid", "invalid", 13),
+        ("prompt_tokens", "prompt", 9),
+        ("ttft_ms", "ttft p50", 10),
+        ("e2e_ms", "e2e p50", 10),
         ("score", "score", 7),
     )
     print("  ".join(f"{title:<{width}}" for _, title, width in columns))
@@ -156,9 +173,20 @@ def print_table(summaries: list[dict[str, Any]], root: Path) -> None:
     for row in summaries:
         cells = []
         for key, _, width in columns:
-            value = row[key]
+            if key == "prompt_tokens":
+                value = row["efficiency"]["prompt_tokens"]["mean"]
+            elif key == "ttft_ms":
+                value = row["efficiency"]["ttft_ms"]["p50"]
+            elif key == "e2e_ms":
+                value = row["efficiency"]["end_to_end_ms"]["p50"]
+            else:
+                value = row[key]
             if key == "score":
                 text = f"{value:.2f}"
+            elif key == "prompt_tokens":
+                text = f"{value:.1f}" if value is not None else "n/a"
+            elif key in {"ttft_ms", "e2e_ms"}:
+                text = f"{value:.1f} ms" if value is not None else "n/a"
             elif key == "invalid":
                 share = 100 * value / row["rows"] if row["rows"] else 0.0
                 text = f"{value} ({share:.1f}%)"

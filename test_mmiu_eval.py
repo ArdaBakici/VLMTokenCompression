@@ -9,6 +9,7 @@ from mmiu_eval import (
     parse_choice,
     reparse_records,
     score_records,
+    validate_model_coverage,
 )
 
 
@@ -164,6 +165,26 @@ class ManifestTest(unittest.TestCase):
 
                 with self.assertRaises(SystemExit):
                     ensure_manifest(output, resumed)
+
+
+class ModelCoverageTest(unittest.TestCase):
+    def test_rejects_llava_rows_that_cannot_fit_the_32k_context(self):
+        dataset = (
+            {"input_image_path": ["image.jpg"] * 57},
+            {"input_image_path": ["image.jpg"]},
+        )
+        with self.assertRaisesRegex(SystemExit, "57 images"):
+            validate_model_coverage(dataset, [0, 1], "llava-next")
+
+    def test_accepts_a_supported_llava_subset_and_other_families(self):
+        dataset = ({"input_image_path": ["image.jpg"] * 8},)
+        validate_model_coverage(dataset, [0], "llava-next")
+        validate_model_coverage(dataset, [0], "qwen")
+
+    def test_rejects_llava_anyres_rows_above_the_conservative_limit(self):
+        dataset = ({"input_image_path": ["image.jpg"] * 9},)
+        with self.assertRaisesRegex(SystemExit, "9 images"):
+            validate_model_coverage(dataset, [0], "llava-next")
 
 
 if __name__ == "__main__":

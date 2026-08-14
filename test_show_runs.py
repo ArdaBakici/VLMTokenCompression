@@ -73,6 +73,15 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(profile(Path(directory), {"model": "m"}), "baseline")
             self.assertEqual(profile(Path(directory), {}), "unknown")
 
+    def test_names_non_qwen_baseline_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / "server-config.json").write_text(
+                json.dumps({"server_backend": "vllm", "model_family": "internvl"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(profile(run, {"model": "m"}), "baseline internvl")
+
 
 class MmiuSummaryTest(unittest.TestCase):
     def test_counts_unparsed_answers_and_reparses(self):

@@ -10,8 +10,10 @@ resolve_project_python() {
     fi
     local environment_dir="${CONDA_ENV_DIR:-${SCRATCH:-$PROJECT_DIR}/conda-envs}"
     candidates+=(
+        "$environment_dir/vlm-token-compression-bench/bin/python"
         "$environment_dir/qwen3vl-bench/bin/python"
         "$environment_dir/qwen3vl-image-pruning-d093d3037/bin/python"
+        "$HOME/.conda/envs/vlm-token-compression-bench/bin/python"
         "$HOME/.conda/envs/qwen3vl-bench/bin/python"
         "$HOME/.conda/envs/qwen3vl-image-pruning-d093d3037/bin/python"
         "$PROJECT_DIR/.venv/bin/python"

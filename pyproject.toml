@@ -29,6 +29,7 @@ serve = [
 [project.scripts]
 crossvid-eval = "crossvid_eval:main"
 crossvid-score = "crossvid_score:main"
+efficiency-compare = "efficiency_metrics:main"
 mmiu-eval = "mmiu_eval:main"
 
 [dependency-groups]
@@ -59,7 +60,7 @@ vllm = [
 vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "4eefbf9609e5ddb996e3ac37e192e92466ec35cc", VLLM_PRECOMPILED_WHEEL_VARIANT = "cu129" }
 
 [tool.setuptools]
-py-modules = ["crossvid_eval", "crossvid_score", "mmiu_eval"]
+py-modules = ["crossvid_eval", "crossvid_score", "efficiency_metrics", "mmiu_eval", "model_profiles"]
 
 [tool.ruff]
 exclude = [".venv", "vendor"]

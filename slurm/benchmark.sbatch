@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=qwen3vl-bench
+#SBATCH --job-name=vlm-token-compression
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16

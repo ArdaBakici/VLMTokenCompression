@@ -10,12 +10,25 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from crossvid_score import TASKS, index_by_id, read_list
+from efficiency_metrics import (
+    EFFICIENCY_SCHEMA_VERSION,
+    format_efficiency_summary,
+    stream_chat_completion,
+    summarize_efficiency,
+)
+from model_profiles import (
+    MODEL_FAMILIES,
+    adapt_messages,
+    chat_template_extra_body,
+    resolve_model_family,
+)
 
 DATASET_ID = "Chuntianli/CrossVid"
 DATASET_REVISION = "4cc98eee034e6f3950c19803485402661f54c1f8"
@@ -98,7 +111,8 @@ def answer_fragment(text: str) -> str:
     tagged = re.search(
         r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL
     )
-    fragment = tagged.group(1) if tagged else text.strip().splitlines()[0]
+    lines = text.strip().splitlines()
+    fragment = tagged.group(1) if tagged else (lines[0] if lines else "")
     return re.sub(
         r"^\s*(?:the\s+)?(?:correct\s+)?answer\s*(?:is|:)\s*",
         "",
@@ -221,7 +235,11 @@ def selected_pairs(pairs: list[dict[str, Any]], start: int, limit: int | None) -
 
 
 def write_result(path: Path, pairs: list[dict[str, Any]], records: dict[str, dict[str, Any]]) -> None:
-    result = [records[str(pair["id"])] for pair in pairs if str(pair["id"]) in records]
+    result = [
+        {key: value for key, value in records[str(pair["id"])].items() if key != "efficiency"}
+        for pair in pairs
+        if str(pair["id"]) in records
+    ]
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     temporary.write_text(json.dumps(result, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -242,6 +260,13 @@ def make_client(args: argparse.Namespace) -> Any:
 
 
 def run_task(task: str, args: argparse.Namespace) -> None:
+    model_family = resolve_model_family(
+        args.model, getattr(args, "model_family", "auto")
+    )
+    try:
+        extra_body = chat_template_extra_body(model_family, args.enable_thinking)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     qa_path = args.qa_dir / f"{task}.json"
     all_pairs = read_list(qa_path)
     pairs = selected_pairs(all_pairs, args.start, args.limit)
@@ -261,15 +286,24 @@ def run_task(task: str, args: argparse.Namespace) -> None:
         try:
             request: dict[str, Any] = {
                 "model": args.model,
-                "messages": messages,
+                "messages": adapt_messages(messages, model_family),
                 "temperature": 0,
                 "max_tokens": args.max_tokens,
             }
-            if not args.enable_thinking:
-                request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-            return response_text(client.chat.completions.create(**request))
+            if extra_body is not None:
+                request["extra_body"] = extra_body
+            thread_state.api_started = time.perf_counter()
+            prediction, efficiency = stream_chat_completion(client, request)
+            thread_state.efficiency = efficiency
+            return prediction
         except Exception as exc:
             thread_state.error = exc
+            if getattr(thread_state, "api_started", None) is not None:
+                thread_state.efficiency = {
+                    "schema_version": EFFICIENCY_SCHEMA_VERSION,
+                    "api_request_ms": 1000
+                    * (time.perf_counter() - thread_state.api_started),
+                }
             raise
 
     module.chat = chat
@@ -280,11 +314,18 @@ def run_task(task: str, args: argparse.Namespace) -> None:
         "crossvid_revision": CROSSVID_REVISION,
         "task": task,
         "model": args.model,
+        "model_family": model_family,
         "base_url": args.base_url,
         "frames": args.frames,
         "length": args.length,
         "max_tokens": args.max_tokens,
         "enable_thinking": args.enable_thinking,
+        "stream": True,
+        "efficiency_schema_version": EFFICIENCY_SCHEMA_VERSION,
+        "workers": args.workers,
+        "timeout": args.timeout,
+        "retries": args.retries,
+        "backend_signature": getattr(args, "backend_signature", None),
         "ids": [pair["id"] for pair in pairs],
     }
     ensure_manifest(state, manifest)
@@ -294,7 +335,10 @@ def run_task(task: str, args: argparse.Namespace) -> None:
     completed = len(pairs) - len(pending)
 
     def infer(pair: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         thread_state.error = None
+        thread_state.efficiency = None
+        thread_state.api_started = None
         try:
             evaluated = module.evaluate(pair, max_tries=1)
             if evaluated is None:
@@ -303,6 +347,14 @@ def run_task(task: str, args: argparse.Namespace) -> None:
                 raise RuntimeError(detail)
             prediction = evaluated[1]
             answer = normalize_answer(task, prediction, pair)
+            efficiency = thread_state.efficiency or {
+                "schema_version": EFFICIENCY_SCHEMA_VERSION
+            }
+            if thread_state.api_started is not None:
+                efficiency["preprocessing_ms"] = 1000 * (
+                    thread_state.api_started - started
+                )
+            efficiency["end_to_end_ms"] = 1000 * (time.perf_counter() - started)
             return {
                 "id": pair["id"],
                 "answer": answer,
@@ -311,8 +363,17 @@ def run_task(task: str, args: argparse.Namespace) -> None:
                 "parse_error": answer is None,
                 "error": None,
                 "model": args.model,
+                "efficiency": efficiency,
             }
         except Exception as exc:  # noqa: BLE001 - failures must be persisted per sample.
+            efficiency = thread_state.efficiency or {
+                "schema_version": EFFICIENCY_SCHEMA_VERSION
+            }
+            if thread_state.api_started is not None:
+                efficiency["preprocessing_ms"] = 1000 * (
+                    thread_state.api_started - started
+                )
+            efficiency["end_to_end_ms"] = 1000 * (time.perf_counter() - started)
             return {
                 "id": pair["id"],
                 "answer": None,
@@ -321,6 +382,7 @@ def run_task(task: str, args: argparse.Namespace) -> None:
                 "parse_error": False,
                 "error": f"{type(exc).__name__}: {exc}",
                 "model": args.model,
+                "efficiency": efficiency,
             }
 
     def persist(record: dict[str, Any]) -> None:
@@ -346,6 +408,8 @@ def run_task(task: str, args: argparse.Namespace) -> None:
     failures = sum(not existing[str(pair["id"])]["success"] for pair in pairs)
     invalid = sum(existing[str(pair["id"])].get("parse_error", False) for pair in pairs)
     print(f"Wrote {result_path} | failures={failures} | unparseable={invalid}")
+    efficiency = summarize_efficiency([existing[str(pair["id"])] for pair in pairs])
+    print(format_efficiency_summary(efficiency))
     if failures:
         raise SystemExit(f"{task} has {failures} failed examples; rerun to retry them")
 
@@ -504,6 +568,10 @@ def parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--start", type=int, default=0)
     run_parser.add_argument("--limit", type=int)
     run_parser.add_argument("--enable-thinking", action="store_true")
+    run_parser.add_argument(
+        "--model-family", choices=MODEL_FAMILIES, default="auto"
+    )
+    run_parser.add_argument("--backend-signature")
     run_parser.set_defaults(function=run_benchmarks)
 
     judge_parser = subparsers.add_parser("judge", help="judge CCQA with the official rubric")

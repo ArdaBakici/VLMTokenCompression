@@ -10,14 +10,31 @@ import os
 import re
 import statistics
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from efficiency_metrics import (
+    EFFICIENCY_SCHEMA_VERSION,
+    format_efficiency_summary,
+    stream_chat_completion,
+    summarize_efficiency,
+)
+from model_profiles import (
+    MODEL_FAMILIES,
+    chat_template_extra_body,
+    resolve_model_family,
+)
+
 DATASET_ID = "FanqingM/MMIU-Benchmark"
 DATASET_REVISION = "03bf7d143d920e97a757f606b6b7baee161b019b"
+# The checkpoint's largest AnyRes grid uses four crops plus the base image,
+# each contributing roughly one 24x24 patch grid. Eight images leave room in
+# the 32K context for image newlines, question text, and generation.
+LLAVA_NEXT_MAX_MMIU_IMAGES = 8
 
 # The official inference script puts the question before the context for these tasks.
 QUESTION_FIRST_TASKS = {
@@ -131,26 +148,14 @@ def image_url(image_path: Path, transport: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def response_text(response: Any) -> str:
-    content = response.choices[0].message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            item.get("text", "")
-            if isinstance(item, dict)
-            else getattr(item, "text", "")
-            for item in content
-        )
-    return str(content or "")
-
-
 def infer_one(
     index: int,
     row: dict[str, Any],
     args: argparse.Namespace,
     client: Any,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
+    api_started = None
     base = {
         "index": index,
         "task": row["task"],
@@ -177,17 +182,25 @@ def infer_one(
             "temperature": 0,
             "max_tokens": args.max_tokens,
         }
-        if not args.enable_thinking:
-            request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-        response = client.chat.completions.create(**request)
-        prediction = response_text(response)
+        model_family = resolve_model_family(
+            args.model, getattr(args, "model_family", "auto")
+        )
+        extra_body = chat_template_extra_body(model_family, args.enable_thinking)
+        if extra_body is not None:
+            request["extra_body"] = extra_body
+        preprocessing_ms = 1000 * (time.perf_counter() - started)
+        api_started = time.perf_counter()
+        prediction, efficiency = stream_chat_completion(client, request)
         parsed = parse_choice(prediction, option_labels(row.get("options") or ""))
+        efficiency["preprocessing_ms"] = preprocessing_ms
+        efficiency["end_to_end_ms"] = 1000 * (time.perf_counter() - started)
         return {
             **base,
             "success": True,
             "prediction": prediction,
             "choice": parsed,
             "error": None,
+            "efficiency": efficiency,
         }
     except Exception as exc:  # noqa: BLE001 - persist all per-row endpoint and media failures.
         return {
@@ -196,6 +209,18 @@ def infer_one(
             "prediction": None,
             "choice": None,
             "error": f"{type(exc).__name__}: {exc}",
+            "efficiency": {
+                "schema_version": EFFICIENCY_SCHEMA_VERSION,
+                "preprocessing_ms": (
+                    1000 * (api_started - started) if api_started is not None else None
+                ),
+                "api_request_ms": (
+                    1000 * (time.perf_counter() - api_started)
+                    if api_started is not None
+                    else None
+                ),
+                "end_to_end_ms": 1000 * (time.perf_counter() - started),
+            },
         }
 
 
@@ -240,6 +265,32 @@ def selected_indices(dataset: Any, args: argparse.Namespace) -> list[int]:
     return selected[: args.limit] if args.limit is not None else selected
 
 
+def validate_model_coverage(
+    dataset: Any, indices: list[int], model_family: str
+) -> None:
+    if model_family != "llava-next":
+        return
+    oversized = [
+        index
+        for index in indices
+        if len(dataset[index]["input_image_path"]) > LLAVA_NEXT_MAX_MMIU_IMAGES
+    ]
+    if oversized:
+        examples = ", ".join(
+            f"{index} ({len(dataset[index]['input_image_path'])} images)"
+            for index in oversized[:5]
+        )
+        raise SystemExit(
+            "LLaVA-NeXT cannot fit every selected MMIU row in its 32K context. "
+            f"At least {len(oversized)} selected rows exceed the safe "
+            f"{LLAVA_NEXT_MAX_MMIU_IMAGES}-image AnyRes limit, which reserves "
+            f"context for question text and output; first: {examples}. Use "
+            "--start/--limit/--tasks for a supported "
+            "subset and report reduced coverage; a strict full MMIU score is not "
+            "available for this checkpoint."
+        )
+
+
 def manifest_path(output: Path) -> Path:
     return output.with_name(f"{output.name}.manifest.json")
 
@@ -266,8 +317,14 @@ def run(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise SystemExit("Install dependencies with: uv sync --extra crossvid") from exc
 
+    args.model_family = resolve_model_family(args.model, args.model_family)
+    try:
+        chat_template_extra_body(args.model_family, args.enable_thinking)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     dataset = load_mmiu(args.dataset_path)
     indices = selected_indices(dataset, args)
+    validate_model_coverage(dataset, indices, args.model_family)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "dataset": DATASET_ID,
@@ -276,10 +333,16 @@ def run(args: argparse.Namespace) -> None:
         if args.dataset_path
         else None,
         "model": args.model,
+        "model_family": args.model_family,
         "base_url": args.base_url,
         "image_transport": args.image_transport,
         "enable_thinking": args.enable_thinking,
         "max_tokens": args.max_tokens,
+        "stream": True,
+        "efficiency_schema_version": EFFICIENCY_SCHEMA_VERSION,
+        "workers": args.workers,
+        "timeout": args.timeout,
+        "retries": args.retries,
         "indices": indices,
     }
     if args.backend_signature is not None:
@@ -376,6 +439,7 @@ def score_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "task_count": len(per_task),
         "macro_accuracy": macro,
         "per_task": per_task,
+        "efficiency": summarize_efficiency(list(latest.values())),
     }
 
 
@@ -443,6 +507,9 @@ def print_score(output: Path, strict: bool, dataset: Any = None) -> None:
         f"Unexpected: {unexpected} | "
         f"API failures: {score['failures']} | Invalid predictions: {score['invalid_predictions']}"
     )
+    efficiency = score["efficiency"]
+    if efficiency["measured_records"]:
+        print(format_efficiency_summary(efficiency))
     if strict and (missing or unexpected or score["failures"]):
         raise SystemExit("Strict scoring failed because the run is invalid or incomplete")
 
@@ -485,6 +552,9 @@ def parser() -> argparse.ArgumentParser:
         "run", help="run model inference and strict scoring"
     )
     run_parser.add_argument("--model", required=True)
+    run_parser.add_argument(
+        "--model-family", choices=MODEL_FAMILIES, default="auto"
+    )
     run_parser.add_argument("--media-root", required=True, type=Path)
     run_parser.add_argument("--output", required=True, type=Path)
     run_parser.add_argument("--dataset-path", help="optional local all.parquet path")

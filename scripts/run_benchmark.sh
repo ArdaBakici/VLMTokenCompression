@@ -8,7 +8,6 @@ BENCHMARK="${BENCHMARK:-${1:-}}"
 MODEL="${MODEL:-${2:-Qwen/Qwen3-VL-8B-Instruct}}"
 PORT="${PORT:-8000}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 WORKERS="${WORKERS:-4}"
 SYNC_ENV="${SYNC_ENV:-1}"
@@ -34,11 +33,77 @@ IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
 # never is inside uv's isolated build, and a driver reporting CUDA 13 then yields
 # cu130 extensions that fail to load. Keep this in step with pyproject.toml.
 IMAGE_PRUNING_WHEEL_VARIANT="${IMAGE_PRUNING_WHEEL_VARIANT:-cu129}"
+MODEL_REVISION="${MODEL_REVISION:-main}"
+MODEL_FAMILY="${MODEL_FAMILY:-auto}"
 
 if [[ "$BENCHMARK" != "mmiu" && "$BENCHMARK" != "crossvid" ]]; then
     printf 'Usage: %s {mmiu|crossvid} [MODEL]\n' "$0" >&2
     printf 'Alternatively set BENCHMARK and MODEL as environment variables.\n' >&2
     exit 2
+fi
+
+if [[ "$MODEL_FAMILY" == "auto" ]]; then
+    case "$MODEL" in
+        Qwen/Qwen3-VL-*) MODEL_FAMILY="qwen" ;;
+        OpenGVLab/InternVL3-8B-hf) MODEL_FAMILY="internvl" ;;
+        llava-hf/llava-v1.6-mistral-7b-hf) MODEL_FAMILY="llava-next" ;;
+        *) MODEL_FAMILY="generic" ;;
+    esac
+fi
+if [[ "$MODEL" == "OpenGVLab/InternVL3-8B" ]]; then
+    printf '%s\n' \
+        'OpenGVLab/InternVL3-8B is the original remote-code format and is not' \
+        'supported by this OpenAI-compatible benchmark profile. Use the native' \
+        'OpenGVLab/InternVL3-8B-hf checkpoint instead.' >&2
+    exit 2
+fi
+
+case "$MODEL_FAMILY" in
+    qwen)
+        DEFAULT_MAX_MODEL_LEN=131072
+        DEFAULT_CROSSVID_FRAMES=128
+        ;;
+    internvl)
+        DEFAULT_MAX_MODEL_LEN=32768
+        DEFAULT_CROSSVID_FRAMES=16
+        ;;
+    llava-next)
+        DEFAULT_MAX_MODEL_LEN=32768
+        DEFAULT_CROSSVID_FRAMES=8
+        ;;
+    generic)
+        DEFAULT_MAX_MODEL_LEN=131072
+        DEFAULT_CROSSVID_FRAMES=128
+        ;;
+    *)
+        printf 'Unsupported MODEL_FAMILY=%s\n' "$MODEL_FAMILY" >&2
+        exit 2
+        ;;
+esac
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}"
+CROSSVID_FRAMES="${FRAMES:-$DEFAULT_CROSSVID_FRAMES}"
+LIMIT_MM_IMAGES="${LIMIT_MM_IMAGES:-128}"
+INTERLEAVE_MM_STRINGS=0
+MM_PROCESSOR_KWARGS=""
+CHAT_TEMPLATE=""
+if [[ "$MODEL_FAMILY" == "llava-next" ]]; then
+    INTERLEAVE_MM_STRINGS=1
+    CHAT_TEMPLATE="$PROJECT_DIR/chat_templates/llava_next_interleaved.jinja"
+fi
+if [[ "$MODEL" == "OpenGVLab/InternVL3-8B-hf" ]]; then
+    MM_PROCESSOR_KWARGS='{"max_patches":1}'
+fi
+
+if [[ "${PRINT_MODEL_PROFILE:-0}" == "1" ]]; then
+    printf '%s\n' \
+        "model=$MODEL" \
+        "model_family=$MODEL_FAMILY" \
+        "max_model_len=$MAX_MODEL_LEN" \
+        "crossvid_frames=$CROSSVID_FRAMES" \
+        "interleave_mm_strings=$INTERLEAVE_MM_STRINGS" \
+        "mm_processor_kwargs=$MM_PROCESSOR_KWARGS" \
+        "chat_template=$CHAT_TEMPLATE"
+    exit 0
 fi
 
 case "$SERVER_BACKEND" in
@@ -139,7 +204,7 @@ CONDA_ENV_DIR="${CONDA_ENV_DIR:-${SCRATCH:-$PROJECT_DIR}/conda-envs}"
 if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
     default_conda_env="$CONDA_ENV_DIR/qwen3vl-image-pruning-d093d3037"
 else
-    default_conda_env="$CONDA_ENV_DIR/qwen3vl-bench"
+    default_conda_env="$CONDA_ENV_DIR/vlm-token-compression-bench"
 fi
 CONDA_ENV="${CONDA_ENV:-$default_conda_env}"
 UV_BIN="$CONDA_ENV/bin/uv"
@@ -282,6 +347,14 @@ PY
     fi
 
     BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;variant=$IMAGE_PRUNING_WHEEL_VARIANT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH;glibc-shim=$GLIBC_SHIM"
+else
+    VLLM_VERSION="$("$CONDA_ENV/bin/python" - <<'PY'
+from importlib.metadata import version
+
+print(version("vllm"))
+PY
+    )"
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;family=$MODEL_FAMILY;revision=$MODEL_REVISION;tp=$TENSOR_PARALLEL_SIZE;dtype=bfloat16;max-model-len=$MAX_MODEL_LEN;mm-images=$LIMIT_MM_IMAGES;interleave-mm=$INTERLEAVE_MM_STRINGS;chat-template=${CHAT_TEMPLATE:-none}"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -380,10 +453,13 @@ trap 'exit 143' TERM INT
 
 printf '%s\n' '--- vLLM startup configuration ---'
 printf 'Model: %s\n' "$MODEL"
+printf 'Model family: %s\n' "$MODEL_FAMILY"
+printf 'Model revision: %s\n' "$MODEL_REVISION"
 printf 'Server backend: %s\n' "$SERVER_BACKEND"
 printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
 printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
+printf 'Multimodal image limit: %s\n' "$LIMIT_MM_IMAGES"
 printf 'GPU memory utilization: %s\n' "$GPU_MEMORY_UTILIZATION"
 printf 'Conda environment: %s\n' "$CONDA_ENV"
 printf 'Server log: %s\n' "$SERVER_LOG"
@@ -399,12 +475,24 @@ vllm_command=(
     "$UV_BIN" run --no-sync vllm serve "$MODEL"
     --host 127.0.0.1
     --port "$PORT"
+    --revision "$MODEL_REVISION"
     --dtype bfloat16
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-    --limit-mm-per-prompt '{"image":128}'
+    --limit-mm-per-prompt "{\"image\":$LIMIT_MM_IMAGES}"
 )
+
+if [[ "$INTERLEAVE_MM_STRINGS" == "1" ]]; then
+    vllm_command+=(--interleave-mm-strings)
+fi
+if [[ -n "$CHAT_TEMPLATE" ]]; then
+    vllm_command+=(--chat-template "$CHAT_TEMPLATE")
+fi
+if [[ -n "$MM_PROCESSOR_KWARGS" ]]; then
+    vllm_command+=(--mm-processor-kwargs "$MM_PROCESSOR_KWARGS")
+    BACKEND_SIGNATURE+=";mm-processor=$MM_PROCESSOR_KWARGS"
+fi
 
 if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
     vllm_command+=(
@@ -455,6 +543,47 @@ expected = {
     "encoder_patch": sys.argv[11],
     "glibc_shim": sys.argv[12],
     "server_arguments": sys.argv[13:],
+}
+if path.exists():
+    actual = json.loads(path.read_text(encoding="utf-8"))
+    if actual != expected:
+        raise SystemExit(f"Run configuration does not match {path}")
+else:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+PY
+else
+    "$CONDA_ENV/bin/python" - \
+        "$RUN_DIR/server-config.json" \
+        "$SERVER_BACKEND" \
+        "$VLLM_VERSION" \
+        "$MODEL" \
+        "$MODEL_FAMILY" \
+        "$MODEL_REVISION" \
+        "$TENSOR_PARALLEL_SIZE" \
+        "$MAX_MODEL_LEN" \
+        "$GPU_MEMORY_UTILIZATION" \
+        "$LIMIT_MM_IMAGES" \
+        "${vllm_command[@]:4}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = {
+    "server_backend": sys.argv[2],
+    "vllm_version": sys.argv[3],
+    "model": sys.argv[4],
+    "model_family": sys.argv[5],
+    "model_revision": sys.argv[6],
+    "tensor_parallel_size": int(sys.argv[7]),
+    "dtype": "bfloat16",
+    "max_model_len": int(sys.argv[8]),
+    "gpu_memory_utilization": sys.argv[9],
+    "limit_mm_images": int(sys.argv[10]),
+    "server_arguments": sys.argv[11:],
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))
@@ -537,10 +666,9 @@ case "$BENCHMARK" in
             --dataset-path "$MMIU_ROOT/all.parquet"
             --output "$RUN_DIR/results.jsonl"
             --workers "$WORKERS"
+            --model-family "$MODEL_FAMILY"
+            --backend-signature "$BACKEND_SIGNATURE"
         )
-        if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
-            mmiu_arguments+=(--backend-signature "$BACKEND_SIGNATURE")
-        fi
         if [[ -n "${MMIU_LIMIT:-}" ]]; then
             mmiu_arguments+=(--limit "$MMIU_LIMIT")
         fi
@@ -560,8 +688,10 @@ case "$BENCHMARK" in
             --vendor-root "$CROSSVID_VENDOR_ROOT" \
             --results-dir "$RUN_DIR" \
             --workers "$WORKERS" \
-            --frames "${FRAMES:-128}" \
-            --length "${FRAME_LENGTH:-360}"
+            --frames "$CROSSVID_FRAMES" \
+            --length "${FRAME_LENGTH:-360}" \
+            --model-family "$MODEL_FAMILY" \
+            --backend-signature "$BACKEND_SIGNATURE"
 
         if [[ "$CROSSVID_TASK" == "all" && -n "${JUDGE_MODEL:-}" ]]; then
             "$UV_BIN" run --no-sync crossvid-eval judge \

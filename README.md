@@ -1,6 +1,6 @@
-# Qwen3-VL Benchmarking
+# VLM Token Compression Benchmarking
 
-Reproducible runners for benchmarking Qwen3-VL models on MMIU and CrossVid
+Reproducible runners for benchmarking Qwen3-VL, InternVL3, and LLaVA-NeXT models on MMIU and CrossVid
 through an OpenAI-compatible vision endpoint such as vLLM. The runners adapt
 the official benchmark implementations and add deterministic answer extraction,
 resumable output, manifests, and strict coverage checks.
@@ -31,7 +31,26 @@ git clone https://github.com/chuntianli666/CrossVid.git vendor/CrossVid
 git -C vendor/CrossVid checkout b53ada63551f9ac4a726b381b627d17ece066281
 ```
 
-## Serve Qwen3-VL
+## Supported Models
+
+The one-command launchers select serving and prompt profiles for these models:
+
+| Model | Hugging Face ID | Context default | Notes |
+| --- | --- | ---: | --- |
+| Qwen3-VL 8B | `Qwen/Qwen3-VL-8B-Instruct` | 131,072 | Existing default; supports the Qwen thinking template option. |
+| InternVL3 8B | `OpenGVLab/InternVL3-8B-hf` | 32,768 | Preferred native Transformers/vLLM checkpoint. |
+| LLaVA-NeXT 7B | `llava-hf/llava-v1.6-mistral-7b-hf` | 32,768 | Mistral image checkpoint; enables multimodal-string interleaving and folds CrossVid's system instruction into the user turn. |
+
+Use `MODEL_REVISION` to pin a checkpoint commit. Runs record model family,
+revision, vLLM version, context length, tensor parallelism, dtype, image limit,
+and exact server arguments in `server-config.json`; resuming with different
+server settings is rejected.
+
+The LLaVA checkpoint above is the standard image-based LLaVA-NeXT model, not
+LLaVA-NeXT-Video. CrossVid continues to use the official sampled-frame pipeline
+and sends each selected frame as an image.
+
+## Serve A Model
 
 ```bash
 uv sync --python 3.11 --extra crossvid --extra serve --group dev
@@ -43,9 +62,29 @@ uv run vllm serve Qwen/Qwen3-VL-8B-Instruct \
   --limit-mm-per-prompt '{"image":128}'
 ```
 
-Replace the model ID with the Qwen3-VL checkpoint being measured. Use a
-separate result path for each checkpoint and keep server settings fixed when
-comparing models or token-compression methods.
+Replace the model ID with the checkpoint being measured. Use a separate result
+path for each checkpoint and keep server settings fixed when comparing models or
+token-compression methods.
+
+The documented manual server command is Qwen-specific. Prefer the launchers
+below for InternVL and LLaVA because they apply the required model profile.
+
+Run MMIU with either added model using:
+
+```bash
+scripts/run_mmiu.sh OpenGVLab/InternVL3-8B-hf
+scripts/run_mmiu.sh llava-hf/llava-v1.6-mistral-7b-hf
+```
+
+Only the native `OpenGVLab/InternVL3-8B-hf` format is supported. The original
+remote-code checkpoint does not ship a vLLM-compatible chat template.
+
+LLaVA-NeXT supports MMIU smoke tests and subsets, but not a strict full MMIU
+score: the released benchmark contains rows with up to 62 images and AnyRes
+visual-token expansion depends on image dimensions. The evaluator applies a
+conservative eight-image ceiling derived from the checkpoint's largest configured
+AnyRes grid, rejects a selected subset containing larger rows before inference,
+and identifies their indices. Report any filtered run as reduced coverage.
 
 ## MMIU Data
 
@@ -246,6 +285,74 @@ result directory. Keep `--frames`, `--length`, media, decoding, and CCQA judge
 fixed. For token-compression experiments, also record compression settings,
 model revision, vLLM version, GPU type, memory, latency, and throughput. The
 result manifests capture inference-facing settings but not custom model internals.
+
+### Efficiency Metrics
+
+New inference runs stream responses and store an `efficiency` object with every
+MMIU result and internal CrossVid state record. This does not change generated
+text or CrossVid's exported `TASK_result.json` schema. The following metrics are
+collected per example:
+
+| Field | Definition |
+| --- | --- |
+| `ttft_ms` | Client-observed time from API submission to the first non-empty generated content or reasoning event. |
+| `api_request_ms` | Time until the stream, including its final usage event, is complete. |
+| `e2e_generation_ms` | API submission through the terminal completion event. |
+| `preprocessing_ms` | Local media/path and prompt preparation before API submission. For CrossVid this includes official video frame extraction and JPEG encoding. |
+| `end_to_end_ms` | Local preprocessing, API generation, and answer parsing. Executor queue time is excluded. |
+| `tpot_ms` | Time per output token after the first: `(completion event - first token) / (completion tokens - 1)`. It is absent for outputs shorter than two tokens. |
+| `output_tokens_per_second` | Per-request decode rate, the inverse of TPOT. This is not aggregate server throughput. |
+| `prompt_tokens` | Server-reported rendered input length, including multimodal placeholders. |
+| `completion_tokens` / `total_tokens` | Server-reported output and total token counts. |
+| `visual_tokens_before` / `visual_tokens_after` | Optional custom server fields at the compression boundary. Standard OpenAI and vLLM responses do not expose them. |
+
+Durations use a monotonic clock. TTFT is client-perceived, so it includes request
+transport, server queueing, multimodal processing, prefill, and first-event
+delivery, but excludes local preprocessing. Report p50 and tail percentiles with
+the worker count: the default four workers measure serving under concurrency,
+not isolated single-request latency. Use `--workers 1` when measuring latency.
+SDK retry and backoff time is included in a logical request's latency, while
+usage covers only the successful response.
+
+`scripts/show_results.sh` now includes mean prompt tokens and p50 TTFT/end-to-end
+latency. Its `--json` output contains the complete mean, p50, p95, and p99
+summary plus token totals. Existing runs remain readable and show `n/a` because
+latency and usage cannot be reconstructed after inference. Because streaming is
+part of the immutable run configuration, start a new run rather than resuming a
+pre-instrumentation manifest.
+
+Compare a compressed run against an otherwise identical baseline with:
+
+```bash
+uv run efficiency-compare \
+  results/baseline/run \
+  results/compressed/run
+```
+
+The comparison pairs examples by MMIU index or CrossVid task and ID, preventing
+failures or subset differences from biasing token totals. If the compressed
+backend reports measured visual token counts for every paired example, it reports:
+
+- `retention_ratio = visual_tokens_after / visual_tokens_before`
+- `reduction_fraction = 1 - retention_ratio`
+- `compression_factor = visual_tokens_before / visual_tokens_after`
+
+Otherwise it reports the same values for **total prompt tokens** and labels the
+metric `paired_total_prompt_tokens`. This is a useful end-to-end proxy for the
+current image-pruning backend, whose processor shortens multimodal placeholders,
+but it is not a general visual-token count. Methods that prune inside later LLM
+layers can reduce compute without changing API prompt usage. For those methods,
+instrument the model at a named boundary and expose the two optional usage
+fields. Always store raw before/after counts because "compression ratio" is used
+inconsistently across papers.
+
+Common additional serving metrics are aggregate requests/s, aggregate output
+tokens/s, and peak GPU memory. They require a controlled timed load interval or
+server/worker instrumentation and are intentionally not inferred from concurrent
+per-request timings. For memory, measure post-warmup peak allocated and reserved
+bytes inside every vLLM GPU worker, or sample device framebuffer use with
+NVML/DCGM on dedicated GPUs; `--gpu-memory-utilization` is a configuration, not
+a measured peak.
 
 Two wrappers report on completed runs. Neither starts a server, synchronizes the
 lockfile, or bootstraps Conda: they locate an environment that already has the
@@ -494,7 +601,8 @@ scripts/run_mmiu.sh
 ```
 
 It defaults to `Qwen/Qwen3-VL-8B-Instruct`, `data/MMIU`, and the persistent
-Conda prefix `${SCRATCH}/conda-envs/qwen3vl-bench` when `SCRATCH` is set. Supply
+Conda prefix `${SCRATCH}/conda-envs/vlm-token-compression-bench` when `SCRATCH`
+is set. Supply
 a different model as the first argument:
 
 ```bash
@@ -504,7 +612,7 @@ scripts/run_mmiu.sh Qwen/Qwen3-VL-32B-Instruct
 Override locations or run a short smoke test with environment variables:
 
 ```bash
-CONDA_ENV=/scratch/$USER/conda-envs/qwen3vl-bench \
+CONDA_ENV=/scratch/$USER/conda-envs/vlm-token-compression-bench \
 MMIU_ROOT=/scratch/$USER/datasets/MMIU \
 MMIU_LIMIT=10 \
   scripts/run_mmiu.sh
@@ -543,6 +651,24 @@ media, starts vLLM, and runs all ten tasks:
 ```bash
 scripts/run_crossvid.sh
 ```
+
+Run the added models with:
+
+```bash
+scripts/run_crossvid.sh OpenGVLab/InternVL3-8B-hf
+scripts/run_crossvid.sh llava-hf/llava-v1.6-mistral-7b-hf
+```
+
+Qwen retains the official runner's 128-frame default. InternVL3 defaults to 16
+frames and LLaVA-NeXT to 8 because AnyRes can use substantially more visual
+tokens per image, while both models have a 32K text context. CrossVid InternVL
+runs additionally restrict dynamic tiling to one patch per sampled frame. The
+same one-patch InternVL profile is used for MMIU so high image-count rows fit the
+context; this processor setting is recorded with the run.
+Override `FRAMES` only deliberately and keep it fixed across runs being compared;
+the value is recorded in each task manifest. `LIMIT_MM_IMAGES` changes the vLLM
+media-count allowance but does not make an oversized visual prompt fit the
+context.
 
 It accepts the same model argument, `RUN_DIR`, and `RUN_ID` handling as
 `scripts/run_mmiu.sh`, and reads `CROSSVID_ROOT`, `CROSSVID_TASK`, `FRAMES`,
@@ -613,8 +739,8 @@ prefixes where `conda env list` already looks:
 CONDA_ENV_DIR="$HOME/.conda/envs" scripts/run_mmiu.sh
 ```
 
-That creates `~/.conda/envs/qwen3vl-bench`, which conda then treats as a named
-environment you can `conda activate qwen3vl-bench`.
+That creates `~/.conda/envs/vlm-token-compression-bench`, which conda then treats
+as a named environment you can `conda activate vlm-token-compression-bench`.
 
 `CONDA_ENV` still overrides the full path of a single environment. Prefer
 `CONDA_ENV_DIR` when you use both server backends: one exported `CONDA_ENV`
@@ -650,7 +776,7 @@ To use explicit data and environment locations:
 sbatch \
   --partition=gpu \
   --account=YOUR_ACCOUNT \
-  --export=ALL,MODULES=YOUR_CONDA_MODULE,BENCHMARK=mmiu,MODEL=Qwen/Qwen3-VL-8B-Instruct,CONDA_ENV=/scratch/$USER/conda-envs/qwen3vl-bench,MMIU_ROOT=/datasets/MMIU,SYNC_ENV=1,BOOTSTRAP_CONDA=1 \
+  --export=ALL,MODULES=YOUR_CONDA_MODULE,BENCHMARK=mmiu,MODEL=Qwen/Qwen3-VL-8B-Instruct,CONDA_ENV=/scratch/$USER/conda-envs/vlm-token-compression-bench,MMIU_ROOT=/datasets/MMIU,SYNC_ENV=1,BOOTSTRAP_CONDA=1 \
   slurm/benchmark.sbatch
 ```
 
@@ -661,7 +787,7 @@ sbatch \
   --partition=gpu \
   --account=YOUR_ACCOUNT \
   --gres=gpu:4 \
-  --export=ALL,MODULES=YOUR_CONDA_MODULE,BENCHMARK=crossvid,MODEL=Qwen/Qwen3-VL-32B-Instruct,TENSOR_PARALLEL_SIZE=4,CONDA_ENV=/scratch/$USER/conda-envs/qwen3vl-bench,CROSSVID_ROOT=/datasets/CrossVid,SYNC_ENV=1,BOOTSTRAP_CONDA=1 \
+  --export=ALL,MODULES=YOUR_CONDA_MODULE,BENCHMARK=crossvid,MODEL=Qwen/Qwen3-VL-32B-Instruct,TENSOR_PARALLEL_SIZE=4,CONDA_ENV=/scratch/$USER/conda-envs/vlm-token-compression-bench,CROSSVID_ROOT=/datasets/CrossVid,SYNC_ENV=1,BOOTSTRAP_CONDA=1 \
   slurm/benchmark.sbatch
 ```
 

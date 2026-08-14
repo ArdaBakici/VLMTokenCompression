@@ -1,7 +1,9 @@
 README.md
 crossvid_eval.py
 crossvid_score.py
+efficiency_metrics.py
 mmiu_eval.py
+model_profiles.py
 pyproject.toml
 vlm_token_compression_eval.egg-info/PKG-INFO
 vlm_token_compression_eval.egg-info/SOURCES.txt
