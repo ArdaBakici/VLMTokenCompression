@@ -12,4 +12,4 @@ tqdm>=4.66
 vllm
 
 [serve]
-vllm<1,>=0.11
+vllm==0.25.1

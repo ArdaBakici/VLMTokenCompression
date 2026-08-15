@@ -26,7 +26,17 @@ image-pruning = [
   "vllm",
 ]
 serve = [
-  "vllm>=0.11,<1",
+  # Exact pin, not a range: nvidia-nccl-cu12 and nvidia-nccl-cu13 (one per
+  # torch/CUDA target) install to the identical path
+  # ".../nvidia/nccl/lib/libnccl.so.2". `uv sync --inexact` (needed so uv does
+  # not uninstall Conda's own uv package) never removes a package left behind
+  # by an earlier sync, so an unpinned range that silently changes torch's
+  # CUDA target on a later `uv lock` leaves the wrong file on disk in any
+  # environment synced before the change: torch imports with
+  # "undefined symbol: ncclCommWindowDeregister" or similar. Bump this
+  # deliberately, and reinstall or recreate already-synced environments after
+  # doing so.
+  "vllm==0.25.1",
 ]
 
 [project.scripts]

@@ -235,12 +235,23 @@ if [[ ! -x "$UV_BIN" || ! -x "$CONDA_PYTHON" ]]; then
 fi
 
 # Install locked project packages directly into the Conda environment. --inexact
-# keeps Conda's uv package instead of treating it as an extraneous dependency.
+# keeps Conda's uv package instead of treating it as an extraneous dependency,
+# but as a consequence it never removes a package that an earlier sync against
+# a different lockfile installed and the current lock no longer names under
+# that same distribution name. That matters specifically for the "nvidia-*"
+# CUDA/NCCL packages: nvidia-nccl-cu12 and nvidia-nccl-cu13 (one per backend's
+# pinned torch build) both install to the identical path
+# ".../nvidia/nccl/lib/libnccl.so.2", so if this prefix was ever synced against
+# a lock that pinned the other one, whichever finished writing that shared path
+# last silently wins, independent of which package the CURRENT lock requires.
+# sync_environment is kept as a function, rather than inlined, so the
+# torch-import repair step below can force a clean reinstall of every locked
+# package with the exact same backend-specific invocation, without duplicating
+# it or guessing which specific package collided.
 export UV_PROJECT_ENVIRONMENT="$CONDA_ENV"
-if [[ "$SYNC_ENV" == "1" ]]; then
-    printf 'Synchronizing the locked environment into %s\n' "$CONDA_ENV"
+sync_environment() {
     if [[ "$SERVER_BACKEND" == "vllm" ]]; then
-        "$UV_BIN" sync --frozen --inexact \
+        "$UV_BIN" sync --frozen --inexact "$@" \
             --python "$CONDA_ENV/bin/python" \
             --extra crossvid \
             --extra serve \
@@ -249,12 +260,17 @@ if [[ "$SYNC_ENV" == "1" ]]; then
         VLLM_USE_PRECOMPILED=1 \
         VLLM_PRECOMPILED_WHEEL_COMMIT="$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
         VLLM_PRECOMPILED_WHEEL_VARIANT="$IMAGE_PRUNING_WHEEL_VARIANT" \
-            "$UV_BIN" sync --frozen --inexact \
+            "$UV_BIN" sync --frozen --inexact "$@" \
                 --python "$CONDA_ENV/bin/python" \
                 --extra crossvid \
                 --extra image-pruning \
                 --no-dev
     fi
+}
+
+if [[ "$SYNC_ENV" == "1" ]]; then
+    printf 'Synchronizing the locked environment into %s\n' "$CONDA_ENV"
+    sync_environment
 else
     printf 'Skipping environment synchronization because SYNC_ENV=%s\n' "$SYNC_ENV"
 fi
@@ -503,7 +519,8 @@ fi
 # dynamic linker's own search, so it has no effect if something else (a
 # baked-in RPATH, or an earlier explicit preload) already resolved a
 # different, incompatible copy before LD_LIBRARY_PATH would ever be consulted.
-if ! "$CONDA_PYTHON" - <<'PY'
+check_torch_imports() {
+    "$CONDA_PYTHON" - <<'PY'
 import sys
 try:
     import torch
@@ -528,14 +545,28 @@ except Exception as exc:
         print(f"Could not read /proc/self/maps: {maps_exc}", file=sys.stderr)
     raise SystemExit(1)
 PY
-then
-    printf '\n%s\n' 'ERROR: torch failed to import in the target environment before starting vLLM.' >&2
-    printf '%s\n' 'This is unrelated to server arguments; see the library paths reported above.' \
-        'If a library outside the venv is listed, it is winning over LD_LIBRARY_PATH via a' \
-        "baked-in RPATH or an earlier preload; remove or reorder that library's source (a" \
-        'site module, a stray system path, or a stale install) rather than the launcher' \
-        'arguments.' >&2
-    exit 1
+}
+
+if ! check_torch_imports; then
+    printf '\n%s\n' \
+        'torch failed to import. A prior sync against a different lockfile can' \
+        'leave one "nvidia-*" CUDA/NCCL package on disk while another shares its' \
+        'install path (see README.md, "Only include a cuda module..."); attempting' \
+        'a one-time clean reinstall of every locked package to repair it.' >&2
+    sync_environment --reinstall
+    if ! check_torch_imports; then
+        printf '\n%s\n' 'ERROR: torch still failed to import after a clean reinstall.' >&2
+        printf '%s\n' 'This is unrelated to server arguments; see the library paths reported' \
+            'above. If a library outside the venv is listed, it is winning over' \
+            "LD_LIBRARY_PATH via a baked-in RPATH or an earlier preload; remove or" \
+            "reorder that library's source (a site module, a stray system path, or a" \
+            'stale install) rather than the launcher arguments. If every listed' \
+            'library is inside the venv, remove CONDA_ENV entirely and let' \
+            'BOOTSTRAP_CONDA recreate it from a clean prefix:' \
+            "  rm -rf $CONDA_ENV" >&2
+        exit 1
+    fi
+    printf '%s\n' 'Reinstall repaired the environment; continuing.'
 fi
 
 vllm_command=(

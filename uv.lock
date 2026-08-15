@@ -5584,7 +5584,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=10,<13" },
     { name = "tqdm", marker = "extra == 'crossvid'", specifier = ">=4.66" },
     { name = "vllm", marker = "extra == 'image-pruning'", git = "https://github.com/shhn1/vllm.git?rev=d093d3037350eb7c9de1d149f9311432de2e0adb" },
-    { name = "vllm", marker = "extra == 'serve'", specifier = ">=0.11,<1" },
+    { name = "vllm", marker = "extra == 'serve'", specifier = "==0.25.1" },
 ]
 provides-extras = ["crossvid", "image-pruning", "serve"]
 

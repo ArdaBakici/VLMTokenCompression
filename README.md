@@ -908,17 +908,37 @@ CrossVid score.
 
 Only include a `cuda` module in `MODULES` when it is required to expose
 `conda` or a compiler; the `vllm` and `serve` extras install a self-contained
-CUDA runtime through pip, so a loaded CUDA module is otherwise unnecessary.
-Loading one anyway can prepend an older system NCCL onto `LD_LIBRARY_PATH`
-that shadows the venv's own `nvidia-nccl` wheel, since modern manylinux torch
-wheels use `DT_RUNPATH`, which is searched after `LD_LIBRARY_PATH` rather than
-before it. That produces an error such as `undefined symbol:
-ncclCommWindowDeregister` when `vllm serve` imports `torch`. The launcher
-prepends the venv's own `site-packages/nvidia/*/lib` directories onto
-`LD_LIBRARY_PATH` immediately before starting vLLM so pip-installed CUDA
-libraries always take precedence over anything a site module set, but a
-mismatched module can still break other tooling that runs before the venv is
-resolved.
+CUDA runtime through pip, so a loaded CUDA module is otherwise unnecessary and
+can shadow the venv's own `nvidia-nccl` wheel by prepending an older system
+NCCL onto `LD_LIBRARY_PATH`. The launcher prepends the venv's own
+`site-packages/nvidia/*/lib` directories onto `LD_LIBRARY_PATH` before
+starting vLLM to protect against this.
+
+A second, more common cause of the same symptom (`undefined symbol:
+ncclCommWindowDeregister` or similar when `vllm serve` imports `torch`) is not
+a site module at all: `nvidia-nccl-cu12` and `nvidia-nccl-cu13` (one per
+backend's pinned torch/CUDA build) both install to the identical path
+`.../nvidia/nccl/lib/libnccl.so.2`. The launcher syncs with `uv sync
+--inexact`, required so uv does not uninstall Conda's own `uv` package, but
+`--inexact` also means it never removes a package an earlier sync against a
+different lockfile left behind. If a Conda prefix was ever synced against a
+lock that pinned the other backend's CUDA target, whichever package last wrote
+that shared path wins, independent of what the current lock actually requires.
+The launcher detects this by importing `torch` in the target environment
+before waiting on the full server startup timeout; on failure it reports every
+CUDA/NCCL library actually mapped into the failing process (from
+`/proc/self/maps`, ground truth rather than a search-path guess), attempts one
+clean reinstall of every locked package, and retries. If it still fails after
+reinstalling, remove the prefix entirely and let `BOOTSTRAP_CONDA` recreate it:
+
+```bash
+rm -rf "$CONDA_ENV"   # or the default under CONDA_ENV_DIR
+```
+
+`serve`'s `vllm` dependency is pinned to an exact version rather than a range
+specifically because an unpinned range can silently change torch's CUDA target
+on a later `uv lock`, which is what causes this collision in an
+already-synced, `--inexact` environment in the first place.
 
 ## Tests
 
