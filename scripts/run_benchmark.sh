@@ -471,6 +471,32 @@ else
 fi
 printf '%s\n' '----------------------------------'
 
+# A site-loaded CUDA module (via MODULES=...) prepends its own lib directory
+# onto LD_LIBRARY_PATH, which can shadow the venv's own pip-installed
+# nvidia-nccl/cudnn/etc. wheels: modern manylinux torch wheels link them with
+# DT_RUNPATH rather than DT_RPATH, and DT_RUNPATH is searched after
+# LD_LIBRARY_PATH. An older module-provided libnccl.so can then load in place
+# of the newer one torch was built against, failing with errors such as
+# "undefined symbol: ncclCommWindowDeregister". Put the venv's own CUDA
+# library directories first so pip-installed wheels always win.
+venv_cuda_lib_dirs="$("$CONDA_PYTHON" - <<'PY'
+import pathlib
+import sysconfig
+
+site_packages = pathlib.Path(sysconfig.get_path("purelib"))
+nvidia_root = site_packages / "nvidia"
+if nvidia_root.is_dir():
+    for lib_dir in sorted(nvidia_root.glob("*/lib")):
+        if lib_dir.is_dir():
+            print(lib_dir)
+PY
+)"
+if [[ -n "$venv_cuda_lib_dirs" ]]; then
+    venv_cuda_lib_path="$(printf '%s' "$venv_cuda_lib_dirs" | paste -sd: -)"
+    export LD_LIBRARY_PATH="$venv_cuda_lib_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    printf 'Prepending venv CUDA libraries to LD_LIBRARY_PATH:\n%s\n' "$venv_cuda_lib_dirs"
+fi
+
 vllm_command=(
     "$UV_BIN" run --no-sync vllm serve "$MODEL"
     --host 127.0.0.1

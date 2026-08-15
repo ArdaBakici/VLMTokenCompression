@@ -906,6 +906,20 @@ when the fixed judge is served outside the allocation. Without a judge, the job
 preserves all inference outputs but intentionally does not report an overall
 CrossVid score.
 
+Only include a `cuda` module in `MODULES` when it is required to expose
+`conda` or a compiler; the `vllm` and `serve` extras install a self-contained
+CUDA runtime through pip, so a loaded CUDA module is otherwise unnecessary.
+Loading one anyway can prepend an older system NCCL onto `LD_LIBRARY_PATH`
+that shadows the venv's own `nvidia-nccl` wheel, since modern manylinux torch
+wheels use `DT_RUNPATH`, which is searched after `LD_LIBRARY_PATH` rather than
+before it. That produces an error such as `undefined symbol:
+ncclCommWindowDeregister` when `vllm serve` imports `torch`. The launcher
+prepends the venv's own `site-packages/nvidia/*/lib` directories onto
+`LD_LIBRARY_PATH` immediately before starting vLLM so pip-installed CUDA
+libraries always take precedence over anything a site module set, but a
+mismatched module can still break other tooling that runs before the venv is
+resolved.
+
 ## Tests
 
 ```bash
