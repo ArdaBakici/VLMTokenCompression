@@ -497,6 +497,47 @@ if [[ -n "$venv_cuda_lib_dirs" ]]; then
     printf 'Prepending venv CUDA libraries to LD_LIBRARY_PATH:\n%s\n' "$venv_cuda_lib_dirs"
 fi
 
+# Confirm torch actually imports in this exact environment before waiting on
+# the full server startup timeout. If it fails, report which CUDA/NCCL
+# libraries the process actually mapped: LD_LIBRARY_PATH only affects the
+# dynamic linker's own search, so it has no effect if something else (a
+# baked-in RPATH, or an earlier explicit preload) already resolved a
+# different, incompatible copy before LD_LIBRARY_PATH would ever be consulted.
+if ! "$CONDA_PYTHON" - <<'PY'
+import sys
+try:
+    import torch
+    print(f"torch {torch.__version__} imported OK from {torch.__file__}")
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        with open(f"/proc/{__import__('os').getpid()}/maps") as handle:
+            mapped = sorted({
+                line.split()[-1]
+                for line in handle
+                if line.strip().endswith(".so") or ".so." in line
+            })
+        relevant = [path for path in mapped if "nccl" in path.lower() or "cuda" in path.lower()]
+        if relevant:
+            print("CUDA/NCCL libraries actually mapped into this process:", file=sys.stderr)
+            for path in relevant:
+                print(f"  {path}", file=sys.stderr)
+        else:
+            print("No CUDA/NCCL libraries were mapped before the failure.", file=sys.stderr)
+    except OSError as maps_exc:
+        print(f"Could not read /proc/self/maps: {maps_exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+    printf '\n%s\n' 'ERROR: torch failed to import in the target environment before starting vLLM.' >&2
+    printf '%s\n' 'This is unrelated to server arguments; see the library paths reported above.' \
+        'If a library outside the venv is listed, it is winning over LD_LIBRARY_PATH via a' \
+        "baked-in RPATH or an earlier preload; remove or reorder that library's source (a" \
+        'site module, a stray system path, or a stale install) rather than the launcher' \
+        'arguments.' >&2
+    exit 1
+fi
+
 vllm_command=(
     "$UV_BIN" run --no-sync vllm serve "$MODEL"
     --host 127.0.0.1
