@@ -190,6 +190,20 @@ if [[ "$METHOD" == "visionzip" ]]; then
     clone_pinned "$LLAVA_REPOSITORY" "$LLAVA_COMMIT" "$LLAVA_ROOT"
 fi
 
+# hiprune-qwen and visionzip-qwen's released Qwen2.5-VL code assumes a
+# request's image tokens form one contiguous block, which only holds for a
+# single image; see scripts/patch_qwen_multi_image.py for the exact bug and
+# the (deliberately narrow) fix. This is applied unconditionally -- there is
+# no valid unpatched multi-image mode, only a crash -- and its identifier is
+# recorded in BACKEND_SIGNATURE and server-config.json so results are never
+# mistaken for an unmodified upstream reproduction.
+QWEN_MULTI_IMAGE_PATCH="none"
+if [[ "$MULTI_IMAGE" == "1" ]]; then
+    QWEN_MULTI_IMAGE_PATCH="$("$CONDA_PYTHON" scripts/patch_qwen_multi_image.py \
+        --method "$METHOD" --root "$METHOD_ROOT" --print-id)"
+    "$CONDA_PYTHON" scripts/patch_qwen_multi_image.py --method "$METHOD" --root "$METHOD_ROOT"
+fi
+
 if [[ "$SYNC_ENV" == "1" ]]; then
     "$UV_BIN" pip install --python "$CONDA_PYTHON" -r "$REQUIREMENTS_FILE"
     "$UV_BIN" pip install --python "$CONDA_PYTHON" --no-deps --editable "$PROJECT_DIR"
@@ -246,7 +260,7 @@ mkdir -p "$RUN_DIR"
 SERVER_LOG="$RUN_DIR/official-$METHOD-${SLURM_JOB_ID:-local}.log"
 API_BASE_URL="http://127.0.0.1:$PORT/v1"
 if [[ "$MULTI_IMAGE" == "1" ]]; then
-    BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=false"
+    BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=false;qwen-patch=$QWEN_MULTI_IMAGE_PATCH"
 else
     BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=true"
 fi
@@ -254,7 +268,8 @@ fi
 SERVER_CONFIG="$RUN_DIR/server-config.json"
 "$CONDA_PYTHON" - \
     "$SERVER_CONFIG" "$METHOD" "$REPOSITORY" "$COMMIT" "$MODEL" \
-    "$MODEL_REVISION" "$PARAMETERS" "$BACKEND_SIGNATURE" "$MULTI_IMAGE" <<'PY'
+    "$MODEL_REVISION" "$PARAMETERS" "$BACKEND_SIGNATURE" "$MULTI_IMAGE" \
+    "$QWEN_MULTI_IMAGE_PATCH" <<'PY'
 import json
 import os
 import sys
@@ -275,6 +290,10 @@ expected = {
         "benchmark": "mmiu",
         "max_images_per_example": max_images_per_example,
     },
+    # "none" for the five LLaVA-1.5 methods (unmodified upstream code).
+    # hiprune-qwen/visionzip-qwen record the local-patch identifier(s) applied
+    # to their vendored Qwen2.5-VL fork; see scripts/patch_qwen_multi_image.py.
+    "local_source_patch": sys.argv[10],
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))

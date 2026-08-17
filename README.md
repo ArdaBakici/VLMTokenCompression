@@ -557,10 +557,44 @@ HIPRUNE_QWEN_RETENTION=0.334 HIPRUNE_ALPHA=0.1 HIPRUNE_OBJECT_LAYER=16 \
 `visionzip-qwen` has **no configurable parameters**. Its released Qwen2.5-VL
 fork hardcodes the dominant/contextual token split (65% / 5%) as inline
 literals inside the forward pass, with no parameter, env var, or config
-attribute exposed to change it -- the only way to use a different ratio is to
-edit the vendored file directly, which this project does not do to any
-pinned official code. `PARAMETERS={}` for this method is therefore
+attribute exposed to change it. `PARAMETERS={}` for this method is therefore
 intentional, not an oversight.
+
+#### Local patch: both forks assume a single image
+
+**Both released Qwen2.5-VL forks were only ever tested single-image** (their
+own reported results only cover single-image benchmarks) and crash on
+`num_images > 1` with a tensor size mismatch:
+`RuntimeError: The expanded size of the tensor (N) must match the existing
+size (M) at non-singleton dimension 0`. Both compute which tokens to prune
+using the whole multi-image `<|image_pad|>` span as a *single contiguous
+block* (`img_mask[first:last+1] = ~select_mask`, where `first`/`last` are the
+global min/max image-token position across every image in the request).
+That is only actually contiguous for one image -- with more than one,
+`<|vision_start|>`/`<|vision_end|>` separators between images sit inside
+`[first, last]` too, so the slice no longer matches `select_mask`'s length.
+
+`scripts/run_mmiu_compression.sh` applies `scripts/patch_qwen_multi_image.py`
+to the cloned checkout before starting the server for both methods. The patch
+is narrow and mechanical: it swaps `first:last+1` for the already-computed
+`st_idx` (the exact, possibly-gapped image-token positions), which both
+forks already rely on being ordered consistently with `select_mask` a few
+lines earlier for their unpatched single-image `masked_scatter` step. **It
+does not touch either method's token-selection logic** -- which tokens are
+kept and why is unchanged; only how the selection is written back into a
+sequence that is not one uninterrupted image block. See
+`scripts/patch_qwen_multi_image.py`'s module docstring for the full
+before/after code.
+
+This is the one place in this repository that modifies pinned "official"
+code, and it is recorded, not hidden: the patch identifier(s)
+(`hiprune-qwen-multi-image-mask-v1`,
+`visionzip-qwen-multi-image-mask-v1+visionzip-qwen-multi-image-gather-v1`)
+are appended to `BACKEND_SIGNATURE` (`;qwen-patch=...`) and written to
+`server-config.json` as `local_source_patch`, and `scripts/show_runs.py`
+appends `patch=...` to any run summary that used one. Every other method in
+this file runs unmodified upstream code end to end; only these two do not,
+and only for this one bug.
 
 Because Qwen2.5-VL's NaViT vision encoder emits a variable number of visual
 tokens per image (there is no fixed 576-token boundary like LLaVA-1.5), the

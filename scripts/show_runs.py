@@ -49,7 +49,13 @@ def profile(run: Path, manifest: dict[str, Any]) -> str:
     if method:
         parameters = config.get("parameters", {})
         values = " ".join(f"{key}={value}" for key, value in sorted(parameters.items()))
-        return f"{method} {values}".strip()
+        description = f"{method} {values}".strip()
+        patch = config.get("local_source_patch", "none")
+        if patch != "none":
+            # Marks results that are not an unmodified upstream reproduction;
+            # see scripts/patch_qwen_multi_image.py.
+            description += f" patch={patch}"
+        return description
     if "image_pruning_rate" not in config:
         family = config.get("model_family")
         return (
