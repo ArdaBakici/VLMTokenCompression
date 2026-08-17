@@ -22,6 +22,8 @@ REQUIREMENTS_FILE="backends/official_compression/requirements.txt"
 # each method's own released Qwen2.5-VL fork instead, which is natively
 # multi-image, so they are not capped.
 MULTI_IMAGE=0
+export CONDA_ENV_DIR="/home/${USER}/.conda/envs"
+#export CONDA_ENV="${CONDA_ENV_DIR}/qwen3vl-bench"
 
 case "$METHOD" in
     visionzip)
