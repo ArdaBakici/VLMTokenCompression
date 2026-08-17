@@ -14,6 +14,14 @@ STREAM_SERVER_LOGS="${STREAM_SERVER_LOGS:-1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 LLAVA_REPOSITORY="https://github.com/haotian-liu/LLaVA.git"
 LLAVA_COMMIT="c121f0432da27facab705978f83c4ada465e46fd"
+QWEN_MODEL="Qwen/Qwen2.5-VL-7B-Instruct"
+QWEN_MODEL_REVISION="cc594898137f460bfe9f0759e9844b3ce807cfb5"
+REQUIREMENTS_FILE="backends/official_compression/requirements.txt"
+# LLaVA-1.5 has one <image> placeholder per turn, so those five methods only
+# ever see a single-image MMIU subset. hiprune-qwen and visionzip-qwen wrap
+# each method's own released Qwen2.5-VL fork instead, which is natively
+# multi-image, so they are not capped.
+MULTI_IMAGE=0
 
 case "$METHOD" in
     visionzip)
@@ -51,8 +59,35 @@ case "$METHOD" in
         MODEL_REVISION="a272c74"
         PARAMETERS="{\"pruning_layer\":${FASTV_K:-3},\"pruning_fraction\":${FASTV_R:-0.75}}"
         ;;
+    hiprune-qwen)
+        # Same pinned repository/commit as `hiprune`; only the vendored
+        # Qwen2_5_VL/qwen2_5_vl_HiPrune.py file within it is used instead of
+        # LLaVA/.
+        REPOSITORY="https://github.com/Danielement321/HiPrune.git"
+        COMMIT="82781005a7e72a6be9ede58fd77473efa72b5e4f"
+        MODEL="$QWEN_MODEL"
+        MODEL_REVISION="$QWEN_MODEL_REVISION"
+        PARAMETERS="{\"retained_ratio\":${HIPRUNE_QWEN_RETENTION:-0.223},\"alpha\":${HIPRUNE_ALPHA:-0.1},\"object_layer\":${HIPRUNE_OBJECT_LAYER:-16}}"
+        REQUIREMENTS_FILE="backends/official_compression/requirements-qwen.txt"
+        MULTI_IMAGE=1
+        ;;
+    visionzip-qwen)
+        # Same pinned repository/commit as `visionzip`; only the vendored
+        # Qwen2_5_VL/qwen2_5vl_visionzip.py file within it is used instead of
+        # LLaVA/. That file hardcodes its dominant/contextual token ratios as
+        # inline literals with no exposed knob, so this method has no
+        # parameters -- VISIONZIP_QWEN_* overrides are intentionally not
+        # offered here (see compression_profiles.py).
+        REPOSITORY="https://github.com/JIA-Lab-research/VisionZip.git"
+        COMMIT="8f86b55c6f000eb033e6912538af2dd7dcb30502"
+        MODEL="$QWEN_MODEL"
+        MODEL_REVISION="$QWEN_MODEL_REVISION"
+        PARAMETERS="{}"
+        REQUIREMENTS_FILE="backends/official_compression/requirements-qwen.txt"
+        MULTI_IMAGE=1
+        ;;
     *)
-        printf 'Usage: %s {visionzip|hiprune|cdpruner|divprune|fastv}\n' "$0" >&2
+        printf 'Usage: %s {visionzip|hiprune|cdpruner|divprune|fastv|hiprune-qwen|visionzip-qwen}\n' "$0" >&2
         exit 2
         ;;
 esac
@@ -63,6 +98,11 @@ if [[ "$WORKERS" != "1" ]]; then
 fi
 
 if [[ "${PRINT_COMPRESSION_PROFILE:-0}" == "1" ]]; then
+    if [[ "$MULTI_IMAGE" == "1" ]]; then
+        max_images_per_example="unlimited"
+    else
+        max_images_per_example="1"
+    fi
     printf '%s\n' \
         "method=$METHOD" \
         "repository=$REPOSITORY" \
@@ -70,7 +110,7 @@ if [[ "${PRINT_COMPRESSION_PROFILE:-0}" == "1" ]]; then
         "model=$MODEL" \
         "model_revision=$MODEL_REVISION" \
         "parameters=$PARAMETERS" \
-        "max_images_per_example=1"
+        "max_images_per_example=$max_images_per_example"
     exit 0
 fi
 
@@ -149,8 +189,7 @@ if [[ "$METHOD" == "visionzip" ]]; then
 fi
 
 if [[ "$SYNC_ENV" == "1" ]]; then
-    "$UV_BIN" pip install --python "$CONDA_PYTHON" \
-        -r backends/official_compression/requirements.txt
+    "$UV_BIN" pip install --python "$CONDA_PYTHON" -r "$REQUIREMENTS_FILE"
     "$UV_BIN" pip install --python "$CONDA_PYTHON" --no-deps --editable "$PROJECT_DIR"
     case "$METHOD" in
         visionzip)
@@ -169,6 +208,12 @@ if [[ "$SYNC_ENV" == "1" ]]; then
         fastv)
             "$UV_BIN" pip install --python "$CONDA_PYTHON" --no-deps --editable \
                 "$METHOD_ROOT/src/FastV/llava-hf/transformers"
+            ;;
+        hiprune-qwen | visionzip-qwen)
+            # qwen2_5_vl_HiPrune.py / qwen2_5vl_visionzip.py are standalone
+            # files (no setup.py, no package) loaded directly from
+            # $METHOD_ROOT by official_compression_server.py at runtime, so
+            # there is nothing extra to install beyond $REQUIREMENTS_FILE.
             ;;
     esac
 fi
@@ -198,18 +243,23 @@ RUN_DIR="${RUN_DIR:-$RESULTS_ROOT/$MODEL_TAG-mmiu-$METHOD/$RUN_ID}"
 mkdir -p "$RUN_DIR"
 SERVER_LOG="$RUN_DIR/official-$METHOD-${SLURM_JOB_ID:-local}.log"
 API_BASE_URL="http://127.0.0.1:$PORT/v1"
-BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=true"
+if [[ "$MULTI_IMAGE" == "1" ]]; then
+    BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=false"
+else
+    BACKEND_SIGNATURE="official-$METHOD@$COMMIT;model=$MODEL;revision=$MODEL_REVISION;parameters=$PARAMETERS;single-image=true"
+fi
 
 SERVER_CONFIG="$RUN_DIR/server-config.json"
 "$CONDA_PYTHON" - \
     "$SERVER_CONFIG" "$METHOD" "$REPOSITORY" "$COMMIT" "$MODEL" \
-    "$MODEL_REVISION" "$PARAMETERS" "$BACKEND_SIGNATURE" <<'PY'
+    "$MODEL_REVISION" "$PARAMETERS" "$BACKEND_SIGNATURE" "$MULTI_IMAGE" <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+max_images_per_example = None if sys.argv[9] == "1" else 1
 expected = {
     "server_backend": "official-transformers-adapter",
     "compression_method": sys.argv[2],
@@ -219,7 +269,10 @@ expected = {
     "model_revision": None if sys.argv[6] == "none" else sys.argv[6],
     "parameters": json.loads(sys.argv[7]),
     "backend_signature": sys.argv[8],
-    "benchmark_scope": {"benchmark": "mmiu", "max_images_per_example": 1},
+    "benchmark_scope": {
+        "benchmark": "mmiu",
+        "max_images_per_example": max_images_per_example,
+    },
 }
 if path.exists():
     actual = json.loads(path.read_text(encoding="utf-8"))
@@ -290,9 +343,11 @@ mmiu_arguments=(
     --dataset-path "$MMIU_ROOT/all.parquet"
     --output "$RUN_DIR/results.jsonl"
     --workers "$WORKERS"
-    --max-images-per-example 1
     --backend-signature "$BACKEND_SIGNATURE"
 )
+if [[ "$MULTI_IMAGE" != "1" ]]; then
+    mmiu_arguments+=(--max-images-per-example 1)
+fi
 if [[ -n "${MMIU_LIMIT:-}" ]]; then
     mmiu_arguments+=(--limit "$MMIU_LIMIT")
 fi

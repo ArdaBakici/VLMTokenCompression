@@ -1,9 +1,17 @@
-"""OpenAI-compatible single-image server for pinned official method code."""
+"""OpenAI-compatible server for pinned official method code.
+
+Every method except `hiprune-qwen`/`visionzip-qwen` wraps a LLaVA-1.5-based
+fork and only ever handles exactly one image per request (LLaVA-1.5 has a
+single `<image>` placeholder per conversation turn). `hiprune-qwen` and
+`visionzip-qwen` instead wrap each method's own released Qwen2.5-VL fork,
+which is natively multi-image, so those two accept any number of images.
+"""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import importlib.util
 import json
 import os
 import re
@@ -18,7 +26,34 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
-from compression_profiles import get_profile, validated_parameters, visual_token_counts
+from compression_profiles import (
+    QWEN_MULTI_IMAGE_METHODS,
+    get_profile,
+    validated_parameters,
+    visual_token_counts,
+)
+
+# Files inside each method's own Qwen2.5-VL fork, relative to the pinned
+# repository checkout. Both are complete standalone copies of transformers'
+# modeling_qwen2_5_vl.py (only Qwen2_5_VLConfig/Qwen2_5_VLVisionConfig are
+# imported from transformers itself), so loading them only requires
+# executing the file -- no package `__init__.py` or sys.path changes needed,
+# since their internal imports are all fully qualified (e.g.
+# `from transformers.models.qwen2_5_vl...`), not relative to the checkout.
+QWEN_MODEL_FILES = {
+    "hiprune-qwen": Path("Qwen2_5_VL") / "qwen2_5_vl_HiPrune.py",
+    "visionzip-qwen": Path("Qwen2_5_VL") / "qwen2_5vl_visionzip.py",
+}
+
+
+def _load_module_from_path(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load module {name!r} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_data_url(url: str) -> bytes:
@@ -69,17 +104,31 @@ class OfficialBackend:
         self.method = method
         self.model_id = model
         self.parameters = parameters
-        # LLaVA-1.5 encodes every image as exactly 576 patch tokens, so the
-        # configured budget is the retained count rather than an estimate. It is
-        # still the method's own boundary: FastV keeps all 576 tokens until its
-        # pruning layer, so its prompt usage stays uncompressed.
-        self.visual_tokens_before, self.visual_tokens_after = visual_token_counts(
-            method, parameters
-        )
         self.lock = threading.Lock()
-        if method == "fastv":
+        if method in QWEN_MULTI_IMAGE_METHODS:
+            # Qwen2.5-VL's NaViT vision encoder emits a variable number of
+            # visual tokens per image, so there is no fixed before/after
+            # boundary like LLaVA-1.5's 576 patch tokens. Real counts are
+            # computed per request in _qwen_inputs() from that request's
+            # image_grid_thw and stashed in `state` for _usage() to report;
+            # these are placeholders only used before the first request.
+            self.visual_tokens_before = 0
+            self.visual_tokens_after = 0
+            self._load_qwen(method, model, revision, repository)
+        elif method == "fastv":
+            # LLaVA-1.5 encodes every image as exactly 576 patch tokens, so the
+            # configured budget is the retained count rather than an estimate.
+            # It is still the method's own boundary: FastV keeps all 576
+            # tokens until its pruning layer, so its prompt usage stays
+            # uncompressed.
+            self.visual_tokens_before, self.visual_tokens_after = visual_token_counts(
+                method, parameters
+            )
             self._load_fastv(model, revision, repository)
         else:
+            self.visual_tokens_before, self.visual_tokens_after = visual_token_counts(
+                method, parameters
+            )
             self._load_native_llava(
                 method, model, revision, repository, llava_repository
             )
@@ -161,6 +210,76 @@ class OfficialBackend:
         self.torch = torch
         self.adapter = "hf-fastv"
 
+    def _load_qwen(
+        self, method: str, model: str, revision: str | None, repository: Path
+    ) -> None:
+        if method == "hiprune-qwen":
+            # qwen2_5_vl_HiPrune.py reads these three at *import* time
+            # (module-level globals), so they must be set before the module
+            # is executed, not just before generation.
+            os.environ["HIPRUNE_QWEN_RETENTION"] = str(self.parameters["retained_ratio"])
+            os.environ["HIPRUNE_ALPHA"] = str(self.parameters["alpha"])
+            os.environ["HIPRUNE_OBJECT_LAYER"] = str(self.parameters["object_layer"])
+
+        import torch
+        from transformers import AutoProcessor
+
+        source = repository / QWEN_MODEL_FILES[method]
+        module_name = f"vlm_token_compression_vendor_{method.replace('-', '_')}"
+        module = _load_module_from_path(module_name, source)
+        model_class = module.Qwen2_5_VLForConditionalGeneration
+
+        kwargs: dict[str, Any] = {
+            "torch_dtype": torch.bfloat16,
+            # HiPrune's Qwen2.5-VL fork asserts attn_implementation != "sdpa"
+            # (it needs raw attention weights to rank tokens by attention,
+            # which sdpa's fused kernel does not expose). VisionZip's fork has
+            # no such restriction but "eager" works for it too, so the same
+            # value is used for both rather than adding a per-method knob.
+            "attn_implementation": "eager",
+        }
+        if revision is not None:
+            kwargs["revision"] = revision
+        self.model = model_class.from_pretrained(model, **kwargs).to(0)
+        self.model.eval()
+        self.processor = AutoProcessor.from_pretrained(
+            model, revision=revision, min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28
+        )
+        self.spatial_merge_size = int(self.model.config.vision_config.spatial_merge_size)
+        self.torch = torch
+        self.adapter = "qwen-multi-image"
+
+    def _qwen_inputs(
+        self, text: str, images: list[Any]
+    ) -> tuple[dict[str, Any], int, int]:
+        content = [{"type": "image"} for _ in images] + [{"type": "text", "text": text}]
+        messages = [{"role": "user", "content": content}]
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=[prompt], images=images, return_tensors="pt"
+        ).to(self.model.device)
+        # image_grid_thw is (num_images, 3): (temporal, height, width) in
+        # patches. Dividing by spatial_merge_size**2 gives the number of
+        # visual tokens the vision tower emits per image *before* either
+        # method's pruning runs -- the same quantity each vendored fork calls
+        # n_image_tokens internally, computed here without touching their
+        # forward-pass internals.
+        grid = inputs["image_grid_thw"]
+        before = int(
+            (grid.prod(dim=-1) // (self.spatial_merge_size**2)).sum().item()
+        )
+        if self.method == "hiprune-qwen":
+            # Matches qwen2_5_vl_HiPrune.py's own
+            # `visual_token_num = round(n_image_tokens * RETAIN)`.
+            after = round(before * float(self.parameters["retained_ratio"]))
+        else:
+            # Matches qwen2_5vl_visionzip.py's own hardcoded
+            # `dominant_num = int(0.65 * n) ; contextual_num = max(int(0.05 * n), 1)`.
+            after = int(0.65 * before) + max(int(0.05 * before), 1)
+        return inputs, before, max(1, after)
+
     def _native_inputs(self, text: str, image: Any) -> tuple[Any, dict[str, Any]]:
         from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
         from llava.conversation import conv_templates
@@ -190,7 +309,12 @@ class OfficialBackend:
     def start_generation(
         self, text: str, images: list[Any], max_tokens: int
     ) -> tuple[Any, dict[str, Any]]:
-        if len(images) != 1:
+        if self.adapter == "qwen-multi-image":
+            if not images:
+                raise ValueError(
+                    f"official {self.method} integration requires at least one image; got 0"
+                )
+        elif len(images) != 1:
             raise ValueError(
                 f"official {self.method} integration requires exactly one image; got {len(images)}"
             )
@@ -198,6 +322,8 @@ class OfficialBackend:
         try:
             from transformers import TextIteratorStreamer
 
+            visual_tokens_before = self.visual_tokens_before
+            visual_tokens_after = self.visual_tokens_after
             if self.adapter == "hf-fastv":
                 prompt = f"USER: <image>\n{text}\nASSISTANT:"
                 inputs = self.processor(prompt, images[0], return_tensors="pt").to(
@@ -211,6 +337,26 @@ class OfficialBackend:
                     "use_cache": False,
                 }
                 prompt_tokens = int(inputs["input_ids"].shape[1])
+            elif self.adapter == "qwen-multi-image":
+                inputs, visual_tokens_before, visual_tokens_after = self._qwen_inputs(
+                    text, images
+                )
+                tokenizer = self.processor.tokenizer
+                generate_kwargs = {
+                    **inputs,
+                    "max_new_tokens": max_tokens,
+                    "do_sample": False,
+                    "use_cache": True,
+                }
+                image_token_id = self.model.config.image_token_id
+                image_placeholders = int(
+                    (inputs["input_ids"] == image_token_id).sum().item()
+                )
+                prompt_tokens = (
+                    int(inputs["input_ids"].shape[1])
+                    - image_placeholders
+                    + visual_tokens_after
+                )
             else:
                 input_ids, multimodal = self._native_inputs(text, images[0])
                 tokenizer = self.tokenizer
@@ -241,6 +387,8 @@ class OfficialBackend:
                 "error": None,
                 "prompt_tokens": prompt_tokens,
                 "tokenizer": tokenizer,
+                "visual_tokens_before": visual_tokens_before,
+                "visual_tokens_after": visual_tokens_after,
             }
 
             def generate() -> None:
@@ -259,7 +407,9 @@ class OfficialBackend:
             self.lock.release()
             raise
 
-    def finish_generation(self, state: dict[str, Any], text: str) -> tuple[int, int]:
+    def finish_generation(
+        self, state: dict[str, Any], text: str
+    ) -> tuple[int, int, int, int]:
         try:
             state["thread"].join()
             if state["error"] is not None:
@@ -270,7 +420,12 @@ class OfficialBackend:
             completion_tokens = len(
                 state["tokenizer"].encode(text, add_special_tokens=False)
             )
-            return int(state["prompt_tokens"]), completion_tokens
+            return (
+                int(state["prompt_tokens"]),
+                completion_tokens,
+                int(state["visual_tokens_before"]),
+                int(state["visual_tokens_after"]),
+            )
         finally:
             self.lock.release()
 
@@ -348,12 +503,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 result = "".join(parts)
                 try:
-                    prompt_tokens, completion_tokens = self.backend.finish_generation(
-                        state, result
-                    )
+                    (
+                        prompt_tokens,
+                        completion_tokens,
+                        visual_tokens_before,
+                        visual_tokens_after,
+                    ) = self.backend.finish_generation(state, result)
                 finally:
                     generation_finished = True
-                usage = self._usage(prompt_tokens, completion_tokens)
+                usage = self._usage(
+                    prompt_tokens, completion_tokens, visual_tokens_before, visual_tokens_after
+                )
                 for chunk in (
                     {
                         "id": request_id,
@@ -374,12 +534,17 @@ class Handler(BaseHTTPRequestHandler):
             parts = [part for part in streamer if part]
             result = "".join(parts)
             try:
-                prompt_tokens, completion_tokens = self.backend.finish_generation(
-                    state, result
-                )
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    visual_tokens_before,
+                    visual_tokens_after,
+                ) = self.backend.finish_generation(state, result)
             finally:
                 generation_finished = True
-            usage = self._usage(prompt_tokens, completion_tokens)
+            usage = self._usage(
+                prompt_tokens, completion_tokens, visual_tokens_before, visual_tokens_after
+            )
             self._json(
                 200,
                 {
@@ -407,13 +572,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(400, {"error": {"message": f"{type(exc).__name__}: {exc}"}})
 
-    def _usage(self, prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    def _usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        visual_tokens_before: int,
+        visual_tokens_after: int,
+    ) -> dict[str, int]:
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
-            "visual_tokens_before": self.backend.visual_tokens_before,
-            "visual_tokens_after": self.backend.visual_tokens_after,
+            "visual_tokens_before": visual_tokens_before,
+            "visual_tokens_after": visual_tokens_after,
         }
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from compression_profiles import (
     PROFILES,
+    QWEN_MULTI_IMAGE_METHODS,
     get_profile,
     validated_parameters,
     visual_token_counts,
@@ -22,12 +23,25 @@ LAUNCHER = ROOT / "scripts" / "run_mmiu_compression.sh"
 class CompressionProfileTest(unittest.TestCase):
     def test_profiles_pin_every_official_repository(self):
         self.assertEqual(
-            set(PROFILES), {"visionzip", "hiprune", "cdpruner", "divprune", "fastv"}
+            set(PROFILES),
+            {
+                "visionzip",
+                "hiprune",
+                "cdpruner",
+                "divprune",
+                "fastv",
+                "hiprune-qwen",
+                "visionzip-qwen",
+            },
         )
         for profile in PROFILES.values():
             with self.subTest(method=profile.method):
                 self.assertRegex(profile.commit, r"^[0-9a-f]{40}$")
-                self.assertIn("llava", profile.model.lower())
+                if profile.method in QWEN_MULTI_IMAGE_METHODS:
+                    self.assertIn("qwen", profile.model.lower())
+                    self.assertEqual(profile.adapter, "qwen-multi-image")
+                else:
+                    self.assertIn("llava", profile.model.lower())
                 self.assertIsNotNone(profile.model_revision)
 
     def test_validates_method_specific_parameters(self):
@@ -35,12 +49,23 @@ class CompressionProfileTest(unittest.TestCase):
             validated_parameters("visionzip", {"dominant_tokens": 54}),
             {"dominant_tokens": 54, "contextual_tokens": 10},
         )
+        self.assertEqual(
+            validated_parameters("hiprune-qwen", {"retained_ratio": 0.334}),
+            {"retained_ratio": 0.334, "alpha": 0.1, "object_layer": 16},
+        )
+        self.assertEqual(validated_parameters("visionzip-qwen", {}), {})
         invalid = (
             ("visionzip", {"dominant_tokens": 576}),
             ("hiprune", {"alpha": 2.0}),
             ("cdpruner", {"retained_tokens": 0}),
             ("divprune", {"retained_ratio": 0}),
             ("fastv", {"pruning_fraction": 1}),
+            ("hiprune-qwen", {"retained_ratio": 0}),
+            ("hiprune-qwen", {"alpha": 2.0}),
+            ("hiprune-qwen", {"object_layer": 0}),
+            # visionzip-qwen has no configurable parameters at all -- its
+            # released Qwen2.5-VL fork hardcodes the retention ratio.
+            ("visionzip-qwen", {"dominant_tokens": 54}),
         )
         for method, parameters in invalid:
             with self.subTest(method=method), self.assertRaises(ValueError):
@@ -57,6 +82,15 @@ class CompressionProfileTest(unittest.TestCase):
         for method, after in expected.items():
             parameters = validated_parameters(method, {})
             self.assertEqual(visual_token_counts(method, parameters), (576, after))
+
+    def test_qwen_methods_have_no_static_visual_token_count(self):
+        # Qwen2.5-VL's NaViT encoder emits a variable number of tokens per
+        # image, so unlike the five LLaVA-1.5 methods above, these two
+        # cannot report a static before/after pair from the profile alone.
+        for method in QWEN_MULTI_IMAGE_METHODS:
+            parameters = validated_parameters(method, {})
+            with self.subTest(method=method), self.assertRaises(ValueError):
+                visual_token_counts(method, parameters)
 
     def test_unknown_method_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -77,9 +111,12 @@ class CompressionLauncherTest(unittest.TestCase):
                 text=True,
             )
             profile = dict(line.split("=", 1) for line in result.stdout.splitlines())
+            expected_cap = (
+                "unlimited" if method in QWEN_MULTI_IMAGE_METHODS else "1"
+            )
             with self.subTest(method=method):
                 self.assertEqual(profile["method"], method)
-                self.assertEqual(profile["max_images_per_example"], "1")
+                self.assertEqual(profile["max_images_per_example"], expected_cap)
                 json.loads(profile["parameters"])
 
 
@@ -92,7 +129,7 @@ class FakeBackend:
         return iter(["B"]), {}
 
     def finish_generation(self, state, text):
-        return 100, 1
+        return 100, 1, self.visual_tokens_before, self.visual_tokens_after
 
 
 class AdapterProtocolTest(unittest.TestCase):

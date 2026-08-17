@@ -467,14 +467,17 @@ commit, installs its incompatible legacy model fork in that prefix, starts the
 shared OpenAI-compatible adapter, and runs the normal resumable MMIU evaluator.
 Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` after the environment has been installed.
 
-The released implementations are batch-one, single-image LLaVA paths. The
-launcher therefore sets `--workers 1` by default and evaluates only MMIU rows
-with at most one image. The filter is stored in the manifest and these results
-must be reported as **single-image MMIU subset scores**, never full MMIU scores.
-CrossVid is not supported because it sends multiple sampled frames. The methods
-are also not relabeled as implementations for Qwen3-VL, InternVL3, or the HF
-LLaVA-NeXT-Mistral checkpoint; paper-reported ports without released code are not
-silently reconstructed.
+The released implementations above are batch-one, single-image LLaVA paths.
+The launcher therefore sets `--workers 1` by default and evaluates only MMIU
+rows with at most one image. The filter is stored in the manifest and these
+results must be reported as **single-image MMIU subset scores**, never full
+MMIU scores. CrossVid is not supported because it sends multiple sampled
+frames. The methods are also not relabeled as implementations for Qwen3-VL,
+InternVL3, or the HF LLaVA-NeXT-Mistral checkpoint; paper-reported ports
+without released code are not silently reconstructed. `hiprune-qwen` and
+`visionzip-qwen` below are the exception: they wrap each method's own
+released Qwen2.5-VL fork rather than reconstructing one, so multi-image MMIU
+rows are supported.
 
 Override the official settings with environment variables:
 
@@ -513,6 +516,71 @@ MMIU must already be prepared under `MMIU_ROOT`. Existing baseline setup does
 this automatically. Use `MMIU_TASKS` and `MMIU_LIMIT` to select a smaller
 single-image experiment. Result comparison still requires identical selected
 indices and generation settings.
+
+### Multi-image official methods: HiPrune and VisionZip on Qwen2.5-VL
+
+HiPrune and VisionZip additionally release their own token-pruning forks of
+**Qwen2.5-VL**, which is natively multi-image (unlike LLaVA-1.5). Two more
+methods wrap those forks so MMIU rows with more than one image can be
+evaluated with genuinely official code, rather than the single-image subset
+above:
+
+| Method | Official source commit | Compatible checkpoint | Default setting |
+| --- | --- | --- | --- |
+| HiPrune (Qwen2.5-VL) | `82781005a7e72a6be9ede58fd77473efa72b5e4f` | `Qwen/Qwen2.5-VL-7B-Instruct@cc594898` | 22.3% retained, alpha 0.1, object layer 16 |
+| VisionZip (Qwen2.5-VL) | `8f86b55c6f000eb033e6912538af2dd7dcb30502` | `Qwen/Qwen2.5-VL-7B-Instruct@cc594898` | 65% dominant + 5% contextual (hardcoded, fixed) |
+
+```bash
+scripts/run_mmiu_compression.sh hiprune-qwen
+scripts/run_mmiu_compression.sh visionzip-qwen
+```
+
+These reuse the exact same pinned repository and commit as `hiprune` and
+`visionzip` above -- only a different file within that same checkout is
+loaded (`Qwen2_5_VL/qwen2_5_vl_HiPrune.py` and
+`Qwen2_5_VL/qwen2_5vl_visionzip.py`, both complete standalone forks of
+transformers' own Qwen2.5-VL modeling code, released by the same authors
+alongside the LLaVA-1.5 code). They get their own Conda prefix
+(`official-hiprune-qwen-COMMIT` / `official-visionzip-qwen-COMMIT`) and
+requirements file (`backends/official_compression/requirements-qwen.txt`,
+pinned to a current transformers release) since Qwen2.5-VL needs a much
+newer transformers than the LLaVA-1.5 methods' pinned 4.37.2.
+
+`hiprune-qwen`'s retention ratio, alpha, and object layer are configurable,
+matching the pattern used everywhere else in this file:
+
+```bash
+HIPRUNE_QWEN_RETENTION=0.334 HIPRUNE_ALPHA=0.1 HIPRUNE_OBJECT_LAYER=16 \
+  scripts/run_mmiu_compression.sh hiprune-qwen
+```
+
+`visionzip-qwen` has **no configurable parameters**. Its released Qwen2.5-VL
+fork hardcodes the dominant/contextual token split (65% / 5%) as inline
+literals inside the forward pass, with no parameter, env var, or config
+attribute exposed to change it -- the only way to use a different ratio is to
+edit the vendored file directly, which this project does not do to any
+pinned official code. `PARAMETERS={}` for this method is therefore
+intentional, not an oversight.
+
+Because Qwen2.5-VL's NaViT vision encoder emits a variable number of visual
+tokens per image (there is no fixed 576-token boundary like LLaVA-1.5), the
+adapter cannot report a static `visual_tokens_before`/`visual_tokens_after`
+pair the way the five LLaVA-1.5 methods do. Instead it computes both values
+per request from that request's `image_grid_thw`, using each fork's own
+published retention formula (`round(n_image_tokens * RETAIN)` for HiPrune,
+`int(0.65 * n) + max(int(0.05 * n), 1)` for VisionZip).
+
+`--max-images-per-example` is not set for these two methods (MMIU rows are
+evaluated regardless of image count), and `MMIU_LIMIT`/`MMIU_TASKS` work the
+same way as for the single-image methods. One caveat: `mmiu_eval.py`'s
+context-fit pre-filter (`--max-model-len`, default 32768) estimates
+per-image token cost using LLaVA-NeXT's formula, which does not apply to
+Qwen2.5-VL's NaViT tokenizer -- treat rows it accepts or rejects as an
+approximate bound for these two methods, not an exact one, and rely on the
+server's own errors for any request that still does not fit.
+
+HiPrune's Qwen2.5-VL fork is MIT licensed; VisionZip's is Apache-2.0, same as
+their LLaVA-1.5 code.
 
 ## Experimental Image Pruning
 

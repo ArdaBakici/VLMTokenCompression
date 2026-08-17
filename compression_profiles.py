@@ -68,7 +68,48 @@ PROFILES = {
         defaults={"pruning_layer": 3, "pruning_fraction": 0.75},
         license="Apache-2.0",
     ),
+    # The two profiles below wire up each method's *own* released Qwen2.5-VL
+    # fork (not this project's code) so MMIU rows with more than one image can
+    # be evaluated. Qwen2.5-VL's NaViT vision encoder emits a variable number
+    # of visual tokens per image (there is no fixed 576-token boundary like
+    # LLaVA-1.5), so unlike the profiles above, visual token counts for these
+    # two methods cannot be known from the profile alone -- see
+    # `visual_token_counts` and `official_compression_server.py`, which
+    # computes them per request from each request's `image_grid_thw`.
+    "hiprune-qwen": CompressionProfile(
+        method="hiprune-qwen",
+        repository="https://github.com/Danielement321/HiPrune.git",
+        commit="82781005a7e72a6be9ede58fd77473efa72b5e4f",
+        adapter="qwen-multi-image",
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        model_revision="cc594898137f460bfe9f0759e9844b3ce807cfb5",
+        # Defaults follow HiPrune's README hyperparameter table for Qwen2.5-VL
+        # (HIPRUNE_QWEN_RETENTION, HIPRUNE_ALPHA, HIPRUNE_OBJECT_LAYER).
+        defaults={"retained_ratio": 0.223, "alpha": 0.1, "object_layer": 16},
+        license="MIT",
+    ),
+    "visionzip-qwen": CompressionProfile(
+        method="visionzip-qwen",
+        repository="https://github.com/JIA-Lab-research/VisionZip.git",
+        commit="8f86b55c6f000eb033e6912538af2dd7dcb30502",
+        adapter="qwen-multi-image",
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        model_revision="cc594898137f460bfe9f0759e9844b3ce807cfb5",
+        # VisionZip's Qwen2.5-VL fork (Qwen2_5_VL/qwen2_5vl_visionzip.py)
+        # hardcodes its dominant/contextual token ratios (0.65 / 0.05) as
+        # inline literals in the forward pass -- there is no parameter, env
+        # var, or config attribute exposed to change them without editing the
+        # vendored file. This profile therefore has no configurable
+        # parameters; any override is rejected by `validated_parameters`.
+        defaults={},
+        license="Apache-2.0",
+    ),
 }
+
+# Methods whose released code targets Qwen2.5-VL instead of LLaVA-1.5. These
+# support more than one image per MMIU row; see `visual_token_counts` below
+# for why they cannot report static before/after token counts.
+QWEN_MULTI_IMAGE_METHODS = frozenset({"hiprune-qwen", "visionzip-qwen"})
 
 
 def get_profile(method: str) -> CompressionProfile:
@@ -116,12 +157,29 @@ def validated_parameters(
             raise ValueError("FastV pruning_layer must select a decoder layer")
         if not 0 <= parameters["pruning_fraction"] < 1:
             raise ValueError("FastV pruning_fraction must be in [0, 1)")
+    elif method == "hiprune-qwen":
+        if not 0 < parameters["retained_ratio"] <= 1:
+            raise ValueError(
+                "hiprune-qwen retained_ratio must be greater than 0 and at most 1"
+            )
+        if not 0 <= parameters["alpha"] <= 1:
+            raise ValueError("hiprune-qwen alpha must be between 0 and 1")
+        if not 1 <= parameters["object_layer"] <= 32:
+            raise ValueError("hiprune-qwen object_layer must select a vision layer")
     return parameters
 
 
 def visual_token_counts(
     method: str, parameters: dict[str, float | int]
 ) -> tuple[int, int]:
+    if method in QWEN_MULTI_IMAGE_METHODS:
+        raise ValueError(
+            f"{method} has no static visual token count: Qwen2.5-VL's NaViT "
+            "vision encoder emits a variable number of tokens per image "
+            "(no fixed 576-token boundary), and the released fork prunes a "
+            "ratio of whatever that count is. Counts must be computed per "
+            "request from that request's image_grid_thw instead."
+        )
     before = 576
     if method == "visionzip":
         after = int(parameters["dominant_tokens"] + parameters["contextual_tokens"])
