@@ -18,6 +18,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -562,6 +563,18 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         except Exception as exc:  # noqa: BLE001 - API boundary returns model failures.
+            # Once streaming has started (response_started), the client only
+            # sees the connection drop -- it never receives this exception,
+            # so it must be logged here or it is lost entirely. That is what
+            # happened before this log line existed: a background
+            # model.generate() failure surfaced to mmiu_eval only as "chat
+            # completion stream ended without a finish reason", with an
+            # empty server log and no way to find the real cause.
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.write(
+                f"request failed (response_started={response_started}): "
+                f"{type(exc).__name__}: {exc}\n"
+            )
             if state is not None and not generation_finished:
                 try:
                     self.backend.finish_generation(state, "")

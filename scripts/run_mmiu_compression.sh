@@ -313,19 +313,34 @@ else
 fi
 SERVER_PID=$!
 
-"$CONDA_PYTHON" - "$API_BASE_URL/models" "$SERVER_PID" "$SERVER_START_TIMEOUT" <<'PY'
+"$CONDA_PYTHON" - "$API_BASE_URL/models" "$SERVER_PID" "$SERVER_START_TIMEOUT" "$MODEL" <<'PY'
+import json
 import os
 import sys
 import time
 import urllib.request
 
-url, pid, timeout = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+url, pid, timeout, model = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 deadline = time.monotonic() + timeout
 while time.monotonic() < deadline:
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
             if response.status == 200:
-                raise SystemExit(0)
+                # A 200 alone is not enough: some *other* OpenAI-compatible
+                # server (e.g. a still-running vLLM job from a different
+                # benchmark, possibly left over on the same default PORT)
+                # could already be listening here and would also answer 200,
+                # while our server is still loading -- silently racing mmiu_eval
+                # ahead against the wrong backend. Require the expected model
+                # id to actually be listed before treating this as ready.
+                body = json.loads(response.read())
+                served = {entry.get("id") for entry in body.get("data", [])}
+                if model in served:
+                    raise SystemExit(0)
+                sys.stderr.write(
+                    f"{url} is answering but does not yet serve {model!r} "
+                    f"(currently serving {sorted(served)}); still waiting.\n"
+                )
     except OSError:
         pass
     try:
@@ -333,7 +348,7 @@ while time.monotonic() < deadline:
     except OSError:
         raise SystemExit("official compression server exited before readiness")
     time.sleep(5)
-raise SystemExit(f"timed out waiting for {url}")
+raise SystemExit(f"timed out waiting for {url} to serve {model!r}")
 PY
 
 mmiu_arguments=(
