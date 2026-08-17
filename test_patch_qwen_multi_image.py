@@ -3,8 +3,12 @@ import unittest
 from pathlib import Path
 
 from scripts.patch_qwen_multi_image import (
+    HIPRUNE_QWEN_MULTI_IMAGE_CACHE_POSITION,
+    HIPRUNE_QWEN_MULTI_IMAGE_CACHE_RESYNC,
     HIPRUNE_QWEN_MULTI_IMAGE_MASK,
     PATCH_SETS,
+    VISIONZIP_QWEN_MULTI_IMAGE_CACHE_POSITION,
+    VISIONZIP_QWEN_MULTI_IMAGE_CACHE_RESYNC,
     VISIONZIP_QWEN_MULTI_IMAGE_GATHER,
     VISIONZIP_QWEN_MULTI_IMAGE_MASK,
     apply,
@@ -33,7 +37,28 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             position_ids = position_ids[:,:,img_mask]
             attention_mask = attention_mask[:, img_mask]
             inputs_embeds = inputs_embeds[:, img_mask]
+        
+            # print(f"Visual tokens: {visual_token_num}")
         ###################
+        
+        outputs = self.model(
+            cache_position=cache_position,
+        )
+
+        return Qwen2_5_VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=self.rope_deltas,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+    ):
+        return model_inputs
 """
 
 PINNED_VISIONZIP = """\
@@ -64,12 +89,36 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             attention_mask = attention_mask[:, img_mask]
             inputs_embeds[:,contexual_input_idx] =  contextual_tokens
             inputs_embeds = inputs_embeds[:, img_mask]
+            del contextual_tokens, hidden_states_filtered, hidden_to_merge,aggregated_hidden
+
+        outputs = self.model(
+            cache_position=cache_position,
+        )
+
+        return Qwen2_5_VLCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=self.rope_deltas,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+    ):
+        return model_inputs
 """
 
 SOURCES = {
     HIPRUNE_QWEN_MULTI_IMAGE_MASK.identifier: PINNED_HIPRUNE,
+    HIPRUNE_QWEN_MULTI_IMAGE_CACHE_POSITION.identifier: PINNED_HIPRUNE,
+    HIPRUNE_QWEN_MULTI_IMAGE_CACHE_RESYNC.identifier: PINNED_HIPRUNE,
     VISIONZIP_QWEN_MULTI_IMAGE_MASK.identifier: PINNED_VISIONZIP,
     VISIONZIP_QWEN_MULTI_IMAGE_GATHER.identifier: PINNED_VISIONZIP,
+    VISIONZIP_QWEN_MULTI_IMAGE_CACHE_POSITION.identifier: PINNED_VISIONZIP,
+    VISIONZIP_QWEN_MULTI_IMAGE_CACHE_RESYNC.identifier: PINNED_VISIONZIP,
 }
 
 
@@ -115,6 +164,127 @@ class PatchSourceTest(unittest.TestCase):
             "hidden_states_filtered = inputs_embeds[:, first:last+1][:,contextual_mask]",
             patched,
         )
+
+    def test_rebuilds_hiprune_cache_position_after_pruning(self):
+        patched = patch_source(PINNED_HIPRUNE, HIPRUNE_QWEN_MULTI_IMAGE_CACHE_POSITION)
+        assert patched is not None
+        self.assertIn(
+            "cache_position = torch.arange(\n"
+            "                inputs_embeds.shape[1], device=inputs_embeds.device\n"
+            "            )",
+            patched,
+        )
+        # Must come after inputs_embeds is pruned, not before.
+        self.assertLess(
+            patched.index("inputs_embeds = inputs_embeds[:, img_mask]"),
+            patched.index("cache_position = torch.arange("),
+        )
+
+    def test_rebuilds_visionzip_cache_position_after_pruning(self):
+        patched = patch_source(
+            PINNED_VISIONZIP, VISIONZIP_QWEN_MULTI_IMAGE_CACHE_POSITION
+        )
+        assert patched is not None
+        self.assertIn(
+            "cache_position = torch.arange(\n"
+            "                inputs_embeds.shape[1], device=inputs_embeds.device\n"
+            "            )",
+            patched,
+        )
+        self.assertLess(
+            patched.index("inputs_embeds = inputs_embeds[:, img_mask]"),
+            patched.index("cache_position = torch.arange("),
+        )
+
+    def test_hiprune_cache_resync_overrides_the_generation_hook(self):
+        patched = patch_source(PINNED_HIPRUNE, HIPRUNE_QWEN_MULTI_IMAGE_CACHE_RESYNC)
+        assert patched is not None
+        self.assertIn("def _update_model_kwargs_for_generation(", patched)
+        self.assertIn("cached_length = past_key_values.get_seq_length()", patched)
+        # The override must sit before prepare_inputs_for_generation and call
+        # super() rather than reimplementing the base bookkeeping.
+        self.assertLess(
+            patched.index("def _update_model_kwargs_for_generation("),
+            patched.index("def prepare_inputs_for_generation("),
+        )
+        self.assertIn("super()._update_model_kwargs_for_generation(", patched)
+
+    def test_visionzip_cache_resync_overrides_the_generation_hook(self):
+        patched = patch_source(
+            PINNED_VISIONZIP, VISIONZIP_QWEN_MULTI_IMAGE_CACHE_RESYNC
+        )
+        assert patched is not None
+        self.assertIn("def _update_model_kwargs_for_generation(", patched)
+        self.assertLess(
+            patched.index("def _update_model_kwargs_for_generation("),
+            patched.index("def prepare_inputs_for_generation("),
+        )
+        self.assertIn("super()._update_model_kwargs_for_generation(", patched)
+
+    def test_cache_resync_recovers_the_true_cache_length(self):
+        # Exercises the actual arithmetic the patched method runs, independent
+        # of torch: a stand-in past_key_values/attention_mask/cache_position
+        # walked through a prefill (pruned) step and two decode steps.
+        class Cache:
+            def __init__(self, length):
+                self.length = length
+
+            def get_seq_length(self):
+                return self.length
+
+        class Mask(list):
+            @property
+            def shape(self):
+                return (1, len(self))
+
+            def new_ones(self, shape):
+                return Mask([1] * shape[1])
+
+        class CachePosition(list):
+            @property
+            def shape(self):
+                return (len(self),)
+
+            device = "cpu"
+
+        def arange(a, b):
+            return CachePosition(range(a, b))
+
+        def default_super_update(model_kwargs, num_new_tokens):
+            model_kwargs["attention_mask"] = Mask(
+                model_kwargs["attention_mask"] + [1] * num_new_tokens
+            )
+            last = model_kwargs["cache_position"][-1]
+            model_kwargs["cache_position"] = CachePosition([last + num_new_tokens])
+            return model_kwargs
+
+        def patched_update(true_cache, model_kwargs):
+            model_kwargs = default_super_update(model_kwargs, num_new_tokens=1)
+            model_kwargs["past_key_values"] = true_cache
+            cached_length = true_cache.get_seq_length()
+            upcoming = model_kwargs["cache_position"].shape[0]
+            if model_kwargs["attention_mask"].shape[-1] != cached_length + upcoming:
+                model_kwargs["attention_mask"] = model_kwargs["attention_mask"].new_ones(
+                    (1, cached_length + upcoming)
+                )
+                model_kwargs["cache_position"] = arange(
+                    cached_length, cached_length + upcoming
+                )
+            return model_kwargs
+
+        original_length, pruned_length = 1420, 413
+        model_kwargs = {
+            "attention_mask": Mask([1] * original_length),
+            "cache_position": arange(0, original_length),
+        }
+
+        model_kwargs = patched_update(Cache(pruned_length), model_kwargs)
+        self.assertEqual(model_kwargs["attention_mask"].shape[-1], pruned_length + 1)
+        self.assertEqual(list(model_kwargs["cache_position"]), [pruned_length])
+
+        model_kwargs = patched_update(Cache(pruned_length + 1), model_kwargs)
+        self.assertEqual(model_kwargs["attention_mask"].shape[-1], pruned_length + 2)
+        self.assertEqual(list(model_kwargs["cache_position"]), [pruned_length + 1])
 
     def test_reports_already_patched_sources(self):
         for identifier, source in SOURCES.items():

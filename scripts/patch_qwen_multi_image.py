@@ -29,6 +29,27 @@ method's token-selection logic (which tokens to keep, and why) is touched,
 only how the selection is written back into a sequence that is not one
 uninterrupted image block.
 
+Fixing that reveals a second, unrelated bug that both forks also share and
+that has nothing to do with multiple images: `cache_position` is built once,
+before either fork's `forward()` runs, from the request's original (unpruned)
+token count, and is never touched by the pruning code -- so the very next
+line, `self.model(..., cache_position=cache_position, ...)`, builds a causal
+mask from the (now shorter) `inputs_embeds` against a `cache_position` still
+sized for the original prompt, and shape-mismatches the same way one line
+later. Rebuilding `cache_position` as a fresh `torch.arange` matching the
+pruned length fixes that forward() call -- but neither fork overrides
+`_update_model_kwargs_for_generation`, so HF's stock `GenerationMixin` then
+keeps extending `attention_mask`/`cache_position` from the *pre-pruning*
+prompt length for every later decode step, while `past_key_values` only ever
+held the pruned length: the same crash recurs one generated token later.
+This one is not single-image-safe either, and single-image runs of these two
+methods would hit it too the moment more than one output token is generated
+(MMIU's terse "answer with one letter" prompting likely explains why neither
+fork's own reported benchmarks surfaced it). The fix rederives both
+`attention_mask` and `cache_position` from `past_key_values`'s actual length
+after every step -- a no-op once they already agree, i.e. every step after
+the first.
+
 Each patch is applied to the cloned pinned checkout, is idempotent, and
 refuses to run when the pinned source no longer matches what it expects.
 """
@@ -115,11 +136,167 @@ VISIONZIP_QWEN_MULTI_IMAGE_GATHER = Patch(
     ),
 )
 
+# `cache_position` is built once, before either fork's forward() runs, from
+# the request's original (unpruned) token count. Once the mask patches above
+# prune position_ids/attention_mask/inputs_embeds down to the retained
+# budget, cache_position is the one thing left unpruned: the self.model(...)
+# call a few lines later passes it straight through, builds a causal mask
+# sized from the (now shorter) inputs_embeds against this stale, longer
+# cache_position, and shape-mismatches -- `RuntimeError: The size of tensor a
+# (pruned length) must match the size of tensor b (original length) at
+# non-singleton dimension 0`. The pruned tokens are the entire sequence the
+# KV cache will ever have for this prefill, so, like any other model's first
+# forward call, their position for causal-masking and cache-indexing
+# purposes is simply their (now dense) index in it, 0..N-1.
+HIPRUNE_QWEN_MULTI_IMAGE_CACHE_POSITION = Patch(
+    identifier="hiprune-qwen-multi-image-cache-position-v1",
+    target=Path("Qwen2_5_VL") / "qwen2_5_vl_HiPrune.py",
+    original=(
+        "            position_ids = position_ids[:,:,img_mask]\n"
+        "            attention_mask = attention_mask[:, img_mask]\n"
+        "            inputs_embeds = inputs_embeds[:, img_mask]\n"
+        "        \n"
+        '            # print(f"Visual tokens: {visual_token_num}")\n'
+    ),
+    replacement=(
+        "            position_ids = position_ids[:,:,img_mask]\n"
+        "            attention_mask = attention_mask[:, img_mask]\n"
+        "            inputs_embeds = inputs_embeds[:, img_mask]\n"
+        "            # Local patch: hiprune-qwen-multi-image-cache-position-v1.\n"
+        "            # See scripts/patch_qwen_multi_image.py for the full explanation.\n"
+        "            cache_position = torch.arange(\n"
+        "                inputs_embeds.shape[1], device=inputs_embeds.device\n"
+        "            )\n"
+        "        \n"
+        '            # print(f"Visual tokens: {visual_token_num}")\n'
+    ),
+)
+
+VISIONZIP_QWEN_MULTI_IMAGE_CACHE_POSITION = Patch(
+    identifier="visionzip-qwen-multi-image-cache-position-v1",
+    target=Path("Qwen2_5_VL") / "qwen2_5vl_visionzip.py",
+    original=(
+        "            position_ids = position_ids[:,:,img_mask]\n"
+        "            attention_mask = attention_mask[:, img_mask]\n"
+        "            inputs_embeds[:,contexual_input_idx] =  contextual_tokens\n"
+        "            inputs_embeds = inputs_embeds[:, img_mask]\n"
+        "            del contextual_tokens, hidden_states_filtered, hidden_to_merge,aggregated_hidden\n"
+    ),
+    replacement=(
+        "            position_ids = position_ids[:,:,img_mask]\n"
+        "            attention_mask = attention_mask[:, img_mask]\n"
+        "            inputs_embeds[:,contexual_input_idx] =  contextual_tokens\n"
+        "            inputs_embeds = inputs_embeds[:, img_mask]\n"
+        "            # Local patch: visionzip-qwen-multi-image-cache-position-v1.\n"
+        "            # Same bug as hiprune-qwen-multi-image-cache-position-v1; see\n"
+        "            # scripts/patch_qwen_multi_image.py for the full explanation.\n"
+        "            cache_position = torch.arange(\n"
+        "                inputs_embeds.shape[1], device=inputs_embeds.device\n"
+        "            )\n"
+        "            del contextual_tokens, hidden_states_filtered, hidden_to_merge,aggregated_hidden\n"
+    ),
+)
+
+# The cache-position patches above only fix the forward() call they run in
+# (the prefill step where pruning happens). Neither fork overrides
+# _update_model_kwargs_for_generation, so HF's stock GenerationMixin keeps
+# extending attention_mask/cache_position from the pre-pruning prompt length
+# for every later decode step -- it has no way to know forward() quietly
+# processed a shorter sequence. That external bookkeeping and the actual
+# past_key_values (which only ever held the pruned length) then diverge
+# starting with the very first decode step, crashing the same way one token
+# later. Since every request this server sends is a single, unpadded sample,
+# attention_mask is always all-ones; rederiving both it and cache_position
+# from past_key_values.get_seq_length() -- the cache's real length -- after
+# every step keeps them correct regardless of how much pruning happened, and
+# is a no-op once they already agree (i.e. every step after the first).
+UPDATE_MODEL_KWARGS_METHOD = (
+    "    def _update_model_kwargs_for_generation(\n"
+    "        self,\n"
+    "        outputs,\n"
+    "        model_kwargs,\n"
+    "        is_encoder_decoder: bool = False,\n"
+    "        num_new_tokens: int = 1,\n"
+    "    ):\n"
+    "        # Local patch: {identifier}.\n"
+    "        # See scripts/patch_qwen_multi_image.py for the full explanation.\n"
+    "        model_kwargs = super()._update_model_kwargs_for_generation(\n"
+    "            outputs,\n"
+    "            model_kwargs,\n"
+    "            is_encoder_decoder=is_encoder_decoder,\n"
+    "            num_new_tokens=num_new_tokens,\n"
+    "        )\n"
+    "        past_key_values = model_kwargs.get(\"past_key_values\")\n"
+    "        attention_mask = model_kwargs.get(\"attention_mask\")\n"
+    "        cache_position = model_kwargs.get(\"cache_position\")\n"
+    "        if (\n"
+    "            is_encoder_decoder\n"
+    "            or past_key_values is None\n"
+    "            or attention_mask is None\n"
+    "            or cache_position is None\n"
+    "        ):\n"
+    "            return model_kwargs\n"
+    "        cached_length = past_key_values.get_seq_length()\n"
+    "        upcoming = cache_position.shape[0]\n"
+    "        if attention_mask.shape[-1] == cached_length + upcoming:\n"
+    "            return model_kwargs\n"
+    "        model_kwargs[\"attention_mask\"] = attention_mask.new_ones(\n"
+    "            (attention_mask.shape[0], cached_length + upcoming)\n"
+    "        )\n"
+    "        model_kwargs[\"cache_position\"] = torch.arange(\n"
+    "            cached_length, cached_length + upcoming, device=cache_position.device\n"
+    "        )\n"
+    "        return model_kwargs\n"
+    "\n"
+    "    def prepare_inputs_for_generation(\n"
+)
+
+_UPDATE_MODEL_KWARGS_ANCHOR = (
+    "            rope_deltas=self.rope_deltas,\n"
+    "        )\n"
+    "\n"
+    "    def prepare_inputs_for_generation(\n"
+)
+
+HIPRUNE_QWEN_MULTI_IMAGE_CACHE_RESYNC = Patch(
+    identifier="hiprune-qwen-multi-image-cache-resync-v1",
+    target=Path("Qwen2_5_VL") / "qwen2_5_vl_HiPrune.py",
+    original=_UPDATE_MODEL_KWARGS_ANCHOR,
+    replacement=(
+        "            rope_deltas=self.rope_deltas,\n"
+        "        )\n"
+        "\n"
+        + UPDATE_MODEL_KWARGS_METHOD.format(
+            identifier="hiprune-qwen-multi-image-cache-resync-v1"
+        )
+    ),
+)
+
+VISIONZIP_QWEN_MULTI_IMAGE_CACHE_RESYNC = Patch(
+    identifier="visionzip-qwen-multi-image-cache-resync-v1",
+    target=Path("Qwen2_5_VL") / "qwen2_5vl_visionzip.py",
+    original=_UPDATE_MODEL_KWARGS_ANCHOR,
+    replacement=(
+        "            rope_deltas=self.rope_deltas,\n"
+        "        )\n"
+        "\n"
+        + UPDATE_MODEL_KWARGS_METHOD.format(
+            identifier="visionzip-qwen-multi-image-cache-resync-v1"
+        )
+    ),
+)
+
 PATCH_SETS = {
-    "hiprune-qwen": (HIPRUNE_QWEN_MULTI_IMAGE_MASK,),
+    "hiprune-qwen": (
+        HIPRUNE_QWEN_MULTI_IMAGE_MASK,
+        HIPRUNE_QWEN_MULTI_IMAGE_CACHE_POSITION,
+        HIPRUNE_QWEN_MULTI_IMAGE_CACHE_RESYNC,
+    ),
     "visionzip-qwen": (
         VISIONZIP_QWEN_MULTI_IMAGE_MASK,
         VISIONZIP_QWEN_MULTI_IMAGE_GATHER,
+        VISIONZIP_QWEN_MULTI_IMAGE_CACHE_POSITION,
+        VISIONZIP_QWEN_MULTI_IMAGE_CACHE_RESYNC,
     ),
 }
 

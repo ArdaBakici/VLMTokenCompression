@@ -560,41 +560,73 @@ literals inside the forward pass, with no parameter, env var, or config
 attribute exposed to change it. `PARAMETERS={}` for this method is therefore
 intentional, not an oversight.
 
-#### Local patch: both forks assume a single image
+#### Local patch: both forks assume a single image, and assume one output token
 
 **Both released Qwen2.5-VL forks were only ever tested single-image** (their
-own reported results only cover single-image benchmarks) and crash on
-`num_images > 1` with a tensor size mismatch:
+own reported results only cover single-image benchmarks) and hit two
+independent bugs once used the way this pipeline needs: multiple images, and
+more than one generated output token.
+
+**Bug 1: pruning assumes one contiguous image-token block.** Both forks
+compute which tokens to prune using the whole multi-image `<|image_pad|>`
+span as a *single contiguous block* (`img_mask[first:last+1] =
+~select_mask`, where `first`/`last` are the global min/max image-token
+position across every image in the request). That is only actually
+contiguous for one image -- with more than one, `<|vision_start|>`/
+`<|vision_end|>` separators between images sit inside `[first, last]` too, so
+the slice no longer matches `select_mask`'s length:
 `RuntimeError: The expanded size of the tensor (N) must match the existing
-size (M) at non-singleton dimension 0`. Both compute which tokens to prune
-using the whole multi-image `<|image_pad|>` span as a *single contiguous
-block* (`img_mask[first:last+1] = ~select_mask`, where `first`/`last` are the
-global min/max image-token position across every image in the request).
-That is only actually contiguous for one image -- with more than one,
-`<|vision_start|>`/`<|vision_end|>` separators between images sit inside
-`[first, last]` too, so the slice no longer matches `select_mask`'s length.
+size (M) at non-singleton dimension 0`. The fix swaps `first:last+1` for the
+already-computed `st_idx` (the exact, possibly-gapped image-token
+positions), which both forks already rely on being ordered consistently with
+`select_mask` a few lines earlier for their unpatched single-image
+`masked_scatter` step.
+
+**Bug 2: pruning silently desyncs the KV cache from `.generate()`'s own
+bookkeeping**, which is not actually specific to multiple images -- it would
+hit single-image requests too, the moment more than one output token is
+generated (MMIU's terse "answer with one letter" prompting most likely
+explains why neither fork's own reported benchmarks surfaced it). Both
+forks' pruning only runs once, on the first (prefill) forward call; from
+then on `pixel_values` is set to `None` and pruning never runs again for that
+request. Two things break as a result:
+
+  - `cache_position` for that first call is built from the request's
+    original (unpruned) token count *before* the pruning code runs, and
+    pruning never touches it -- so the very next line,
+    `self.model(..., cache_position=cache_position, ...)`, builds a causal
+    mask from the (now shorter) `inputs_embeds` against a `cache_position`
+    still sized for the original prompt, and the same shape-mismatch recurs
+    one line later.
+  - Neither fork overrides `_update_model_kwargs_for_generation`, so HF's
+    stock `GenerationMixin` keeps extending `attention_mask`/`cache_position`
+    from the *pre-pruning* prompt length for every later decode step, while
+    `past_key_values` only ever held the pruned length -- the same crash
+    recurs one generated token later still.
+
+The fix rebuilds `cache_position` as a fresh `torch.arange` matching the
+pruned length for the first call (exactly what a first forward call
+populating a cache from scratch should have), and overrides
+`_update_model_kwargs_for_generation` to rederive both `attention_mask` and
+`cache_position` from `past_key_values`'s actual length after every step --
+a no-op once they already agree, i.e. every step after the first.
 
 `scripts/run_mmiu_compression.sh` applies `scripts/patch_qwen_multi_image.py`
-to the cloned checkout before starting the server for both methods. The patch
-is narrow and mechanical: it swaps `first:last+1` for the already-computed
-`st_idx` (the exact, possibly-gapped image-token positions), which both
-forks already rely on being ordered consistently with `select_mask` a few
-lines earlier for their unpatched single-image `masked_scatter` step. **It
-does not touch either method's token-selection logic** -- which tokens are
-kept and why is unchanged; only how the selection is written back into a
-sequence that is not one uninterrupted image block. See
-`scripts/patch_qwen_multi_image.py`'s module docstring for the full
-before/after code.
+to the cloned checkout before starting the server for both methods. Every
+patch is narrow and mechanical -- indexing and generation-loop bookkeeping
+only. **None of them touch either method's token-selection logic**: which
+tokens are kept and why is exactly what the released code decides; only how
+that selection is threaded through a multi-image, multi-token-output request
+is corrected. See `scripts/patch_qwen_multi_image.py`'s module docstring for
+the full before/after code and reasoning for each patch.
 
 This is the one place in this repository that modifies pinned "official"
-code, and it is recorded, not hidden: the patch identifier(s)
-(`hiprune-qwen-multi-image-mask-v1`,
-`visionzip-qwen-multi-image-mask-v1+visionzip-qwen-multi-image-gather-v1`)
-are appended to `BACKEND_SIGNATURE` (`;qwen-patch=...`) and written to
-`server-config.json` as `local_source_patch`, and `scripts/show_runs.py`
-appends `patch=...` to any run summary that used one. Every other method in
-this file runs unmodified upstream code end to end; only these two do not,
-and only for this one bug.
+code, and it is recorded, not hidden: the patch identifier(s) are appended to
+`BACKEND_SIGNATURE` (`;qwen-patch=...`) and written to `server-config.json`
+as `local_source_patch`, and `scripts/show_runs.py` appends `patch=...` to
+any run summary that used one. Every other method in this file runs
+unmodified upstream code end to end; only these two do not, and only for
+these two bugs.
 
 Because Qwen2.5-VL's NaViT vision encoder emits a variable number of visual
 tokens per image (there is no fixed 576-token boundary like LLaVA-1.5), the
