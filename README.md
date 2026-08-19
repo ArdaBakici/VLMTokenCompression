@@ -636,14 +636,48 @@ per request from that request's `image_grid_thw`, using each fork's own
 published retention formula (`round(n_image_tokens * RETAIN)` for HiPrune,
 `int(0.65 * n) + max(int(0.05 * n), 1)` for VisionZip).
 
-`--max-images-per-example` is not set for these two methods (MMIU rows are
-evaluated regardless of image count), and `MMIU_LIMIT`/`MMIU_TASKS` work the
-same way as for the single-image methods. One caveat: `mmiu_eval.py`'s
-context-fit pre-filter (`--max-model-len`, default 32768) estimates
-per-image token cost using LLaVA-NeXT's formula, which does not apply to
-Qwen2.5-VL's NaViT tokenizer -- treat rows it accepts or rejects as an
-approximate bound for these two methods, not an exact one, and rely on the
-server's own errors for any request that still does not fit.
+`--max-images-per-example` is not set for these two methods by default (MMIU
+rows are evaluated regardless of image count), and `MMIU_LIMIT`/`MMIU_TASKS`
+work the same way as for the single-image methods. One caveat:
+`mmiu_eval.py`'s context-fit pre-filter (`--max-model-len`, default 32768)
+estimates per-image token cost using LLaVA-NeXT's formula, which does not
+apply to Qwen2.5-VL's NaViT tokenizer -- treat rows it accepts or rejects as
+an approximate bound for these two methods, not an exact one, and rely on
+the server's own errors for any request that still does not fit.
+
+Both forks must run their entire vision tower in eager attention (to expose
+the raw per-layer attention weights their pruning ranks tokens by), which is
+an `O(n^2)` cost in combined image-token count that pruning cannot reduce,
+since it only ever runs after the vision tower has already encoded every
+image in full. MMIU's video-derived tasks (frames sampled as separate images)
+can have far more images per row than the rest of the benchmark, and can
+exhaust device memory as a result -- this is a real computational cost of
+each method as released, not something patchable. Three independent levers,
+roughly in order of how much they cost to try:
+
+```bash
+# 1. Free, zero risk: PyTorch's caching allocator can leave a lot of memory
+#    reserved-but-unusably-fragmented (visible in the OOM message as
+#    "reserved by PyTorch but unallocated"); this lets it defragment.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  scripts/run_mmiu_compression.sh hiprune-qwen
+
+# 2. Direct and quadratic: the O(n^2) cost above is quadratic in per-image
+#    resolution, so even a moderate cap has an outsized effect (e.g. halving
+#    the patch cap cuts this one allocation to roughly a quarter). Defaults
+#    to 256..1280 patches/image (Qwen2.5-VL's own usage-example range);
+#    lower max to trade image fidelity for memory headroom.
+QWEN_MAX_PIXELS_PATCHES=512 scripts/run_mmiu_compression.sh hiprune-qwen
+
+# 3. Coarsest: skip rows above a chosen image count outright instead of
+#    letting them OOM.
+MAX_IMAGES_PER_EXAMPLE=8 scripts/run_mmiu_compression.sh hiprune-qwen
+```
+
+These combine freely and none require re-preparing MMIU. Left at their
+defaults, rows are never skipped or downscaled for their image count, and any
+that exhaust device memory are recorded as ordinary per-row failures in
+`results.jsonl`, the same as any other API failure.
 
 HiPrune's Qwen2.5-VL fork is MIT licensed; VisionZip's is Apache-2.0, same as
 their LLaVA-1.5 code.

@@ -243,8 +243,21 @@ class OfficialBackend:
             kwargs["revision"] = revision
         self.model = model_class.from_pretrained(model, **kwargs).to(0)
         self.model.eval()
+        # Both forks must run their entire vision tower in eager attention to
+        # expose the raw per-layer attention weights their pruning ranks
+        # tokens by (see scripts/patch_qwen_multi_image.py), which is an
+        # O(n^2) cost in combined image-token count that pruning cannot
+        # reduce -- it only ever runs after the vision tower already encoded
+        # every image in full. Per-image resolution is therefore a direct,
+        # quadratic memory lever for many-image requests (MMIU's video-derived
+        # tasks especially); QWEN_MIN_PIXELS/QWEN_MAX_PIXELS let it be tuned
+        # without editing code. 28*28 is Qwen2.5-VL's patch size, so these are
+        # expressed in patches for readability (1280 patches ~ 1003520 px,
+        # the value both methods' own Qwen2.5-VL usage examples use).
+        min_pixels = int(os.environ.get("QWEN_MIN_PIXELS_PATCHES", 256)) * 28 * 28
+        max_pixels = int(os.environ.get("QWEN_MAX_PIXELS_PATCHES", 1280)) * 28 * 28
         self.processor = AutoProcessor.from_pretrained(
-            model, revision=revision, min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28
+            model, revision=revision, min_pixels=min_pixels, max_pixels=max_pixels
         )
         self.spatial_merge_size = int(self.model.config.vision_config.spatial_merge_size)
         self.torch = torch

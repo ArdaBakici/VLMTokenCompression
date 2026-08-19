@@ -101,7 +101,7 @@ fi
 
 if [[ "${PRINT_COMPRESSION_PROFILE:-0}" == "1" ]]; then
     if [[ "$MULTI_IMAGE" == "1" ]]; then
-        max_images_per_example="unlimited"
+        max_images_per_example="${MAX_IMAGES_PER_EXAMPLE:-unlimited}"
     else
         max_images_per_example="1"
     fi
@@ -269,14 +269,22 @@ SERVER_CONFIG="$RUN_DIR/server-config.json"
 "$CONDA_PYTHON" - \
     "$SERVER_CONFIG" "$METHOD" "$REPOSITORY" "$COMMIT" "$MODEL" \
     "$MODEL_REVISION" "$PARAMETERS" "$BACKEND_SIGNATURE" "$MULTI_IMAGE" \
-    "$QWEN_MULTI_IMAGE_PATCH" <<'PY'
+    "$QWEN_MULTI_IMAGE_PATCH" "${MAX_IMAGES_PER_EXAMPLE:-none}" <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-max_images_per_example = None if sys.argv[9] == "1" else 1
+if sys.argv[9] != "1":
+    # The five LLaVA-1.5 methods: always capped to a single image.
+    max_images_per_example = 1
+elif sys.argv[11] == "none":
+    # hiprune-qwen/visionzip-qwen, uncapped (the default).
+    max_images_per_example = None
+else:
+    # hiprune-qwen/visionzip-qwen, capped via MAX_IMAGES_PER_EXAMPLE.
+    max_images_per_example = int(sys.argv[11])
 expected = {
     "server_backend": "official-transformers-adapter",
     "compression_method": sys.argv[2],
@@ -383,6 +391,16 @@ mmiu_arguments=(
 )
 if [[ "$MULTI_IMAGE" != "1" ]]; then
     mmiu_arguments+=(--max-images-per-example 1)
+elif [[ -n "${MAX_IMAGES_PER_EXAMPLE:-}" ]]; then
+    # hiprune-qwen/visionzip-qwen must run every vision-tower layer in eager
+    # attention to get the per-layer attention weights their pruning ranks
+    # tokens by (see scripts/patch_qwen_multi_image.py) -- an O(n^2) cost in
+    # combined image-token count that pruning cannot reduce, since it only
+    # ever runs after the vision tower already encoded every image in full.
+    # MMIU's video-derived tasks can have far more images per row than the
+    # rest of the benchmark, and can exhaust device memory as a result; this
+    # is an optional, explicit escape hatch for that, not a default.
+    mmiu_arguments+=(--max-images-per-example "$MAX_IMAGES_PER_EXAMPLE")
 fi
 if [[ -n "${MMIU_LIMIT:-}" ]]; then
     mmiu_arguments+=(--limit "$MMIU_LIMIT")
