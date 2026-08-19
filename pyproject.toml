@@ -10,6 +10,9 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
   "datasets>=2.20,<5",
   "openai>=1.40,<3",
+  # Image headers are read to compute exact LLaVA-NeXT AnyRes prompt lengths
+  # before inference, so oversized rows are identified rather than guessed.
+  "pillow>=10,<13",
 ]
 
 [project.optional-dependencies]
@@ -19,13 +22,27 @@ crossvid = [
   "opencv-python>=4.10",
   "tqdm>=4.66",
 ]
+image-pruning = [
+  "vllm",
+]
 serve = [
-  "vllm>=0.11,<1",
+  # Exact pin, not a range: nvidia-nccl-cu12 and nvidia-nccl-cu13 (one per
+  # torch/CUDA target) install to the identical path
+  # ".../nvidia/nccl/lib/libnccl.so.2". `uv sync --inexact` (needed so uv does
+  # not uninstall Conda's own uv package) never removes a package left behind
+  # by an earlier sync, so an unpinned range that silently changes torch's
+  # CUDA target on a later `uv lock` leaves the wrong file on disk in any
+  # environment synced before the change: torch imports with
+  # "undefined symbol: ncclCommWindowDeregister" or similar. Bump this
+  # deliberately, and reinstall or recreate already-synced environments after
+  # doing so.
+  "vllm==0.25.1",
 ]
 
 [project.scripts]
 crossvid-eval = "crossvid_eval:main"
 crossvid-score = "crossvid_score:main"
+efficiency-compare = "efficiency_metrics:main"
 mmiu-eval = "mmiu_eval:main"
 
 [dependency-groups]
@@ -33,8 +50,30 @@ dev = [
   "ruff>=0.12,<1",
 ]
 
+[tool.uv]
+conflicts = [
+  [
+    { extra = "image-pruning" },
+    { extra = "serve" },
+  ],
+]
+
+[tool.uv.sources]
+vllm = [
+  { git = "https://github.com/shhn1/vllm.git", rev = "d093d3037350eb7c9de1d149f9311432de2e0adb", extra = "image-pruning" },
+]
+
+# VLLM_PRECOMPILED_WHEEL_VARIANT pins the CUDA build of the native extensions.
+# Without it, vLLM's setup.py detects the variant from torch, and falls back to
+# parsing nvidia-smi when torch is not importable, which it never is inside uv's
+# isolated build. On a host whose driver reports CUDA 13 that silently installs
+# cu130 extensions next to the CUDA 12 torch this extra pins, and _moe_C.abi3.so
+# then fails to load.
+[tool.uv.extra-build-variables]
+vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "4eefbf9609e5ddb996e3ac37e192e92466ec35cc", VLLM_PRECOMPILED_WHEEL_VARIANT = "cu129" }
+
 [tool.setuptools]
-py-modules = ["crossvid_eval", "crossvid_score", "mmiu_eval"]
+py-modules = ["compression_profiles", "crossvid_eval", "crossvid_score", "efficiency_metrics", "mmiu_eval", "model_profiles", "official_compression_server"]
 
 [tool.ruff]
 exclude = [".venv", "vendor"]

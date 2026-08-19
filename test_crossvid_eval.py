@@ -78,6 +78,8 @@ class RunnerTest(unittest.TestCase):
                 max_tokens=16,
                 enable_thinking=False,
                 workers=1,
+                timeout=10,
+                retries=0,
             )
 
             run_task("CC", args)
@@ -87,7 +89,80 @@ class RunnerTest(unittest.TestCase):
             )
             self.assertEqual(exported[0]["answer"], "B")
             self.assertTrue(exported[0]["success"])
+            self.assertNotIn("efficiency", exported[0])
             module.evaluate.assert_called_once()
+
+    @patch("crossvid_eval.stream_chat_completion")
+    @patch("crossvid_eval.make_client", return_value=object())
+    @patch("crossvid_eval.load_official_module")
+    def test_adapts_llava_request_and_preserves_media_order(
+        self, load_module, _make_client, stream_completion
+    ):
+        module = SimpleNamespace()
+        image = {"type": "image_url", "image_url": {"url": "data:image/jpeg,x"}}
+        messages = [
+            {"role": "system", "content": "You are a helpful video analyzer."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Video 1:"},
+                    image,
+                    {"type": "text", "text": "Question?"},
+                ],
+            },
+        ]
+
+        def evaluate(pair, max_tries):
+            return pair, module.chat(messages)
+
+        module.evaluate = evaluate
+        load_module.return_value = module
+        stream_completion.return_value = (
+            "B",
+            {"schema_version": 1, "prompt_tokens": 10},
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            qa_dir = root / "QA"
+            qa_dir.mkdir()
+            pair = {
+                "id": 7,
+                "question": "Question?",
+                "options": ["A. First", "B. Second"],
+                "videos": ["one.mp4", "two.mp4"],
+                "answer": "B",
+            }
+            (qa_dir / "CC.json").write_text(json.dumps([pair]))
+            args = argparse.Namespace(
+                qa_dir=qa_dir,
+                start=0,
+                limit=None,
+                vendor_root=root / "vendor",
+                model="llava-hf/llava-v1.6-mistral-7b-hf",
+                model_family="auto",
+                frames=8,
+                length=64,
+                uav_root=root / "uav",
+                video_root=root / "videos",
+                results_dir=root / "results",
+                base_url="http://localhost/v1",
+                max_tokens=16,
+                enable_thinking=False,
+                workers=1,
+                timeout=10,
+                retries=0,
+                backend_signature="test",
+            )
+
+            run_task("CC", args)
+
+        request = stream_completion.call_args.args[1]
+        self.assertNotIn("extra_body", request)
+        self.assertEqual([message["role"] for message in request["messages"]], ["user"])
+        content = request["messages"][0]["content"]
+        self.assertEqual(content[0]["text"], "You are a helpful video analyzer.\n\n")
+        self.assertEqual(content[2], image)
 
 
 if __name__ == "__main__":

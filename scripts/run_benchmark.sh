@@ -7,8 +7,7 @@ PROJECT_DIR="${PROJECT_DIR:-$(dirname "$SCRIPT_DIR")}"
 BENCHMARK="${BENCHMARK:-${1:-}}"
 MODEL="${MODEL:-${2:-Qwen/Qwen3-VL-8B-Instruct}}"
 PORT="${PORT:-8000}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 WORKERS="${WORKERS:-4}"
 SYNC_ENV="${SYNC_ENV:-1}"
@@ -19,12 +18,149 @@ REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-$VLLM_ENGINE_ITERATION_TIMEOUT_S}"
 SERVER_LOG_LINES="${SERVER_LOG_LINES:-200}"
 STREAM_SERVER_LOGS="${STREAM_SERVER_LOGS:-1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
+SERVER_BACKEND="${SERVER_BACKEND:-vllm}"
+IMAGE_PRUNING_RATE="${IMAGE_PRUNING_RATE:-0.3}"
+VIT_ATTENTION_SCORE_LAYER_INDEX="${VIT_ATTENTION_SCORE_LAYER_INDEX:--2}"
+IMAGE_PRUNING_ENCODER_PATCH="${IMAGE_PRUNING_ENCODER_PATCH:-1}"
+IMAGE_PRUNING_GLIBC_SHIM="${IMAGE_PRUNING_GLIBC_SHIM:-0}"
+CROSSVID_REPOSITORY="https://github.com/chuntianli666/CrossVid.git"
+CROSSVID_COMMIT="b53ada63551f9ac4a726b381b627d17ece066281"
+CROSSVID_VENDOR_ROOT="${CROSSVID_VENDOR_ROOT:-$PROJECT_DIR/vendor/CrossVid}"
+IMAGE_PRUNING_VLLM_REPOSITORY="https://github.com/shhn1/vllm.git"
+IMAGE_PRUNING_VLLM_COMMIT="d093d3037350eb7c9de1d149f9311432de2e0adb"
+IMAGE_PRUNING_VLLM_BASE_COMMIT="4eefbf9609e5ddb996e3ac37e192e92466ec35cc"
+# The image-pruning extra pins torch 2.10, which depends on nvidia-*-cu12, so the
+# native extensions must come from the CUDA 12 wheel. Left unset, vLLM's setup.py
+# detects the variant from nvidia-smi whenever torch is not importable, which it
+# never is inside uv's isolated build, and a driver reporting CUDA 13 then yields
+# cu130 extensions that fail to load. Keep this in step with pyproject.toml.
+IMAGE_PRUNING_WHEEL_VARIANT="${IMAGE_PRUNING_WHEEL_VARIANT:-cu129}"
+MODEL_REVISION="${MODEL_REVISION:-main}"
+MODEL_FAMILY="${MODEL_FAMILY:-auto}"
 
 if [[ "$BENCHMARK" != "mmiu" && "$BENCHMARK" != "crossvid" ]]; then
     printf 'Usage: %s {mmiu|crossvid} [MODEL]\n' "$0" >&2
     printf 'Alternatively set BENCHMARK and MODEL as environment variables.\n' >&2
     exit 2
 fi
+
+if [[ "$MODEL_FAMILY" == "auto" ]]; then
+    case "$MODEL" in
+        Qwen/Qwen3-VL-*) MODEL_FAMILY="qwen" ;;
+        OpenGVLab/InternVL3-8B-hf) MODEL_FAMILY="internvl" ;;
+        llava-hf/llava-v1.6-mistral-7b-hf) MODEL_FAMILY="llava-next" ;;
+        *) MODEL_FAMILY="generic" ;;
+    esac
+fi
+if [[ "$MODEL" == "OpenGVLab/InternVL3-8B" ]]; then
+    printf '%s\n' \
+        'OpenGVLab/InternVL3-8B is the original remote-code format and is not' \
+        'supported by this OpenAI-compatible benchmark profile. Use the native' \
+        'OpenGVLab/InternVL3-8B-hf checkpoint instead.' >&2
+    exit 2
+fi
+
+case "$MODEL_FAMILY" in
+    qwen)
+        DEFAULT_MAX_MODEL_LEN=131072
+        DEFAULT_CROSSVID_FRAMES=128
+        ;;
+    internvl)
+        DEFAULT_MAX_MODEL_LEN=32768
+        DEFAULT_CROSSVID_FRAMES=16
+        ;;
+    llava-next)
+        DEFAULT_MAX_MODEL_LEN=32768
+        DEFAULT_CROSSVID_FRAMES=8
+        ;;
+    generic)
+        DEFAULT_MAX_MODEL_LEN=131072
+        DEFAULT_CROSSVID_FRAMES=128
+        ;;
+    *)
+        printf 'Unsupported MODEL_FAMILY=%s\n' "$MODEL_FAMILY" >&2
+        exit 2
+        ;;
+esac
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}"
+CROSSVID_FRAMES="${FRAMES:-$DEFAULT_CROSSVID_FRAMES}"
+LIMIT_MM_IMAGES="${LIMIT_MM_IMAGES:-128}"
+INTERLEAVE_MM_STRINGS=0
+MM_PROCESSOR_KWARGS=""
+CHAT_TEMPLATE=""
+if [[ "$MODEL_FAMILY" == "llava-next" ]]; then
+    INTERLEAVE_MM_STRINGS=1
+    CHAT_TEMPLATE="$PROJECT_DIR/chat_templates/llava_next_interleaved.jinja"
+fi
+if [[ "$MODEL" == "OpenGVLab/InternVL3-8B-hf" ]]; then
+    MM_PROCESSOR_KWARGS='{"max_patches":1}'
+fi
+
+if [[ "${PRINT_MODEL_PROFILE:-0}" == "1" ]]; then
+    printf '%s\n' \
+        "model=$MODEL" \
+        "model_family=$MODEL_FAMILY" \
+        "max_model_len=$MAX_MODEL_LEN" \
+        "crossvid_frames=$CROSSVID_FRAMES" \
+        "interleave_mm_strings=$INTERLEAVE_MM_STRINGS" \
+        "mm_processor_kwargs=$MM_PROCESSOR_KWARGS" \
+        "chat_template=$CHAT_TEMPLATE"
+    exit 0
+fi
+
+case "$SERVER_BACKEND" in
+    vllm)
+        ;;
+    vllm-pr38888-image-pruning)
+        if [[ "$BENCHMARK" != "mmiu" ]]; then
+            printf 'The experimental image-pruning profile currently supports only MMIU.\n' >&2
+            exit 2
+        fi
+        # Both checkpoints share the 27-layer Qwen3-VL vision tower that the PR
+        # scores, so VIT_ATTENTION_SCORE_LAYER_INDEX means the same thing for
+        # each. Other checkpoints are unvalidated: a different vision depth
+        # silently changes which layer the attention scores come from.
+        image_pruning_models=(
+            "Qwen/Qwen3-VL-8B-Instruct"
+            "Qwen/Qwen3-VL-30B-A3B-Instruct"
+        )
+        if [[ ! " ${image_pruning_models[*]} " == *" $MODEL "* ]]; then
+            printf 'The experimental image-pruning profile supports only:\n' >&2
+            printf '  %s\n' "${image_pruning_models[@]}" >&2
+            exit 2
+        fi
+        # MoE checkpoints route through vllm/_moe_C.abi3.so, built by the
+        # precompiled manylinux_2_31 wheel. Dense checkpoints never load that
+        # extension and keep working on older hosts, so this is checked per
+        # model rather than for the whole profile. IMAGE_PRUNING_GLIBC_SHIM
+        # relaxes the check because the extension's only requirement above
+        # glibc 2.14 is log2@GLIBC_2.29; see the shim below.
+        image_pruning_moe_models=("Qwen/Qwen3-VL-30B-A3B-Instruct")
+        host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+        if [[ " ${image_pruning_moe_models[*]} " == *" $MODEL "* && -n "$host_glibc" ]] \
+            && [[ "$IMAGE_PRUNING_GLIBC_SHIM" != "1" ]] \
+            && [[ "$(printf '%s\n2.31\n' "$host_glibc" | sort --version-sort | head -n 1)" != "2.31" ]]; then
+            printf '%s\n' \
+                "This host provides glibc $host_glibc, but the precompiled vLLM" \
+                'wheel needs 2.31 or newer for its MoE extension. Its only' \
+                'requirement above glibc 2.14 is the symbol log2@GLIBC_2.29,' \
+                'which every glibc also provides as log2@GLIBC_2.2.5. Rebind it' \
+                'with IMAGE_PRUNING_GLIBC_SHIM=1, or run the MoE checkpoint on a' \
+                'newer node or inside a container.' >&2
+            exit 2
+        fi
+        if [[ "$TENSOR_PARALLEL_SIZE" != "1" ]]; then
+            printf '%s\n' \
+                'The experimental image-pruning backend is restricted to TENSOR_PARALLEL_SIZE=1.' \
+                'Tensor-parallel token selection is not validated by the upstream PR.' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        printf 'Unsupported SERVER_BACKEND=%s\n' "$SERVER_BACKEND" >&2
+        exit 2
+        ;;
+esac
 
 cd "$PROJECT_DIR"
 
@@ -63,15 +199,39 @@ if ! command -v conda >/dev/null 2>&1; then
     exit 2
 fi
 
-CONDA_ENV="${CONDA_ENV:-${SCRATCH:-$PROJECT_DIR}/conda-envs/qwen3vl-bench}"
+# Directory holding the per-backend Conda prefixes. Set CONDA_ENV_DIR to move
+# every environment at once, for example to "$HOME/.conda/envs" so that conda
+# lists them as named environments. Set CONDA_ENV to place one environment
+# explicitly, keeping in mind that the two server backends must not share a
+# prefix.
+CONDA_ENV_DIR="${CONDA_ENV_DIR:-${SCRATCH:-$PROJECT_DIR}/conda-envs}"
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    default_conda_env="$CONDA_ENV_DIR/qwen3vl-image-pruning-d093d3037"
+else
+    default_conda_env="$CONDA_ENV_DIR/vlm-token-compression-bench"
+fi
+CONDA_ENV="${CONDA_ENV:-$default_conda_env}"
 UV_BIN="$CONDA_ENV/bin/uv"
-if [[ ! -x "$UV_BIN" ]]; then
+CONDA_PYTHON="$CONDA_ENV/bin/python"
+if [[ ! -x "$UV_BIN" || ! -x "$CONDA_PYTHON" ]]; then
     if [[ "$BOOTSTRAP_CONDA" != "1" ]]; then
-        printf 'uv is missing from CONDA_ENV=%s and BOOTSTRAP_CONDA=0.\n' "$CONDA_ENV" >&2
+        printf 'uv or python is missing from CONDA_ENV=%s and BOOTSTRAP_CONDA=0.\n' \
+            "$CONDA_ENV" >&2
         exit 2
     fi
-    if [[ -d "$CONDA_ENV" ]]; then
+    if [[ -x "$CONDA_PYTHON" ]]; then
         conda install --yes --prefix "$CONDA_ENV" --channel conda-forge uv
+    elif [[ -e "$CONDA_ENV" ]]; then
+        # uv is a standalone binary, so installing it into a prefix that has no
+        # interpreter succeeds and leaves an environment uv itself rejects with
+        # "not a valid Python environment". An interrupted conda create leaves
+        # exactly this behind, and repairing it in place is not reliable.
+        printf '%s\n' \
+            "CONDA_ENV=$CONDA_ENV exists but has no Python interpreter." \
+            'An interrupted conda create leaves this behind. Remove the prefix' \
+            'and run again:' \
+            "  rm -rf $CONDA_ENV" >&2
+        exit 2
     else
         conda create --yes --prefix "$CONDA_ENV" --channel conda-forge python=3.11 uv
     fi
@@ -79,70 +239,142 @@ if [[ ! -x "$UV_BIN" ]]; then
 fi
 
 # Install locked project packages directly into the Conda environment. --inexact
-# keeps Conda's uv package instead of treating it as an extraneous dependency.
+# keeps Conda's uv package instead of treating it as an extraneous dependency,
+# but as a consequence it never removes a package that an earlier sync against
+# a different lockfile installed and the current lock no longer names under
+# that same distribution name. That matters specifically for the "nvidia-*"
+# CUDA/NCCL packages: nvidia-nccl-cu12 and nvidia-nccl-cu13 (one per backend's
+# pinned torch build) both install to the identical path
+# ".../nvidia/nccl/lib/libnccl.so.2", so if this prefix was ever synced against
+# a lock that pinned the other one, whichever finished writing that shared path
+# last silently wins, independent of which package the CURRENT lock requires.
+# sync_environment is kept as a function, rather than inlined, so the
+# torch-import repair step below can force a clean reinstall of every locked
+# package with the exact same backend-specific invocation, without duplicating
+# it or guessing which specific package collided.
 export UV_PROJECT_ENVIRONMENT="$CONDA_ENV"
+sync_environment() {
+    if [[ "$SERVER_BACKEND" == "vllm" ]]; then
+        "$UV_BIN" sync --frozen --inexact "$@" \
+            --python "$CONDA_ENV/bin/python" \
+            --extra crossvid \
+            --extra serve \
+            --no-dev
+    else
+        VLLM_USE_PRECOMPILED=1 \
+        VLLM_PRECOMPILED_WHEEL_COMMIT="$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+        VLLM_PRECOMPILED_WHEEL_VARIANT="$IMAGE_PRUNING_WHEEL_VARIANT" \
+            "$UV_BIN" sync --frozen --inexact "$@" \
+                --python "$CONDA_ENV/bin/python" \
+                --extra crossvid \
+                --extra image-pruning \
+                --no-dev
+    fi
+}
+
 if [[ "$SYNC_ENV" == "1" ]]; then
     printf 'Synchronizing the locked environment into %s\n' "$CONDA_ENV"
-    "$UV_BIN" sync --frozen --inexact \
-        --python "$CONDA_ENV/bin/python" \
-        --extra crossvid \
-        --extra serve \
-        --no-dev
+    sync_environment
 else
     printf 'Skipping environment synchronization because SYNC_ENV=%s\n' "$SYNC_ENV"
 fi
 
-count_gpu_list() {
-    local value="$1"
-    local -a gpu_ids
-    IFS=',' read -r -a gpu_ids <<< "$value"
-    printf '%s\n' "${#gpu_ids[@]}"
-}
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    # The MoE extension in the precompiled manylinux_2_31 wheel imports exactly
+    # one symbol above glibc 2.14: log2@GLIBC_2.29. glibc has also exported
+    # log2@GLIBC_2.2.5 since 2.2.5, and the 2.29 entry is a faster
+    # implementation of the same function, so clearing the version requirement
+    # binds it to an implementation every host already has. This is what makes
+    # MoE checkpoints usable below glibc 2.31.
+    GLIBC_SHIM="none"
+    if [[ "$IMAGE_PRUNING_GLIBC_SHIM" == "1" ]]; then
+        "$CONDA_ENV/bin/python" scripts/rebind_moe_glibc.py
+        GLIBC_SHIM="glibc-log2-downgrade-v1"
+    fi
 
-detected_gpu_count=1
-gpu_detection_source="single-GPU default"
-if [[ "${SLURM_GPUS_ON_NODE:-}" =~ ^[1-9][0-9]*$ ]]; then
-    detected_gpu_count="$SLURM_GPUS_ON_NODE"
-    gpu_detection_source="SLURM_GPUS_ON_NODE"
-elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "$CUDA_VISIBLE_DEVICES" != "-1" ]]; then
-    detected_gpu_count="$(count_gpu_list "$CUDA_VISIBLE_DEVICES")"
-    gpu_detection_source="CUDA_VISIBLE_DEVICES"
-elif [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
-    detected_gpu_count="$(count_gpu_list "$SLURM_JOB_GPUS")"
-    gpu_detection_source="SLURM_JOB_GPUS"
-fi
+    VLLM_VERSION="$("$CONDA_ENV/bin/python" - \
+        "$IMAGE_PRUNING_RATE" "$VIT_ATTENTION_SCORE_LAYER_INDEX" <<'PY'
+from importlib.metadata import version
+import sys
 
-if [[ -z "$TENSOR_PARALLEL_SIZE" ]]; then
-    TENSOR_PARALLEL_SIZE="$detected_gpu_count"
-fi
-if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-    printf 'TENSOR_PARALLEL_SIZE must be a positive integer, got %q.\n' \
-        "$TENSOR_PARALLEL_SIZE" >&2
-    exit 2
-fi
+from vllm.config.multimodal import MultiModalConfig
 
-if ! runtime_gpu_count="$($UV_BIN run --no-sync python - <<'PY'
+vllm_version = version("vllm")
+expected_version = "0.1.dev15469+gd093d3037.precompiled"
+if vllm_version != expected_version:
+    raise SystemExit(f"The active vLLM is not the pinned PR build: {vllm_version}")
+if "image_pruning_rate" not in MultiModalConfig.__pydantic_fields__:
+    raise SystemExit("The active vLLM does not expose image_pruning_rate")
+
+# The native extensions come from a precompiled wheel, so a CUDA variant that
+# does not match the pinned torch loads partially: vLLM logs the failure and
+# continues, and the missing operator only surfaces once a model calls it. MoE
+# checkpoints hit this during memory profiling, minutes into startup.
 import torch
 
-print(torch.cuda.device_count())
+try:
+    import vllm._moe_C  # noqa: F401
+except ImportError as exc:
+    raise SystemExit(
+        f"The vLLM MoE extension does not load: {exc}\n"
+        "A GLIBC_2.xx message means this host is older than the manylinux_2_31 "
+        "wheel requires; run MoE checkpoints on a newer node or in a container, "
+        "or benchmark a dense checkpoint here. A CUDA or undefined-symbol "
+        f"message means the wheel variant does not match torch, which is built "
+        f"for CUDA {torch.version.cuda}; rebuild with IMAGE_PRUNING_WHEEL_VARIANT "
+        "set accordingly, for example cu129 for CUDA 12 or cu130 for CUDA 13."
+    ) from exc
+if not hasattr(torch.ops._moe_C, "topk_softmax"):
+    raise SystemExit(
+        "The vLLM MoE extension loaded without registering topk_softmax; the "
+        "precompiled wheel does not match the pinned source revision"
+    )
+
+try:
+    pruning_rate = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("IMAGE_PRUNING_RATE must be a number") from exc
+if not 0.0 < pruning_rate < 1.0:
+    raise SystemExit("IMAGE_PRUNING_RATE must be greater than 0 and less than 1")
+
+try:
+    layer_index = int(sys.argv[2])
+except ValueError as exc:
+    raise SystemExit("VIT_ATTENTION_SCORE_LAYER_INDEX must be an integer") from exc
+if not -27 <= layer_index <= -1:
+    raise SystemExit(
+        "VIT_ATTENTION_SCORE_LAYER_INDEX must select one of the 27 vision layers "
+        "using an index from -27 through -1"
+    )
+print(vllm_version)
 PY
-)"; then
-    printf '%s\n' 'Failed to query CUDA devices through PyTorch.' >&2
-    exit 2
-fi
-if [[ ! "$runtime_gpu_count" =~ ^[0-9]+$ ]]; then
-    printf 'Unexpected PyTorch CUDA device count: %q\n' "$runtime_gpu_count" >&2
-    exit 2
-fi
-if (( runtime_gpu_count < TENSOR_PARALLEL_SIZE )); then
-    printf '%s\n' \
-        'GPU allocation error:' \
-        "  Tensor parallel size: $TENSOR_PARALLEL_SIZE" \
-        "  PyTorch-visible GPUs: $runtime_gpu_count" \
-        "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<not set>}" \
-        "  SLURM_GPUS_ON_NODE: ${SLURM_GPUS_ON_NODE:-<not set>}" \
-        'Request/bind enough GPUs or lower TENSOR_PARALLEL_SIZE.' >&2
-    exit 2
+    )"
+    # The pinned PR build needs two local corrections before it serves MMIU:
+    # the vision tower must encode pruned images one at a time to stay inside
+    # the profiled memory budget, and the MoE checkpoint must assign the image
+    # pruning attribute that its inherited image path reads. See
+    # scripts/patch_image_pruning.py.
+    if [[ "$IMAGE_PRUNING_ENCODER_PATCH" == "1" ]]; then
+        ENCODER_PATCH="$("$CONDA_ENV/bin/python" \
+            scripts/patch_image_pruning.py --print-id)"
+        "$CONDA_ENV/bin/python" scripts/patch_image_pruning.py
+    else
+        ENCODER_PATCH="none"
+        printf '%s\n' \
+            'WARNING: IMAGE_PRUNING_ENCODER_PATCH=0 leaves the local vLLM patches' \
+            'unapplied. Multi-image prompts can exhaust device memory in the' \
+            'vision tower, and MoE checkpoints fail on their first image.' >&2
+    fi
+
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;source=$IMAGE_PRUNING_VLLM_COMMIT;native=$IMAGE_PRUNING_VLLM_BASE_COMMIT;variant=$IMAGE_PRUNING_WHEEL_VARIANT;rate=$IMAGE_PRUNING_RATE;layer=$VIT_ATTENTION_SCORE_LAYER_INDEX;chunked-prefill=false;encoder-patch=$ENCODER_PATCH;glibc-shim=$GLIBC_SHIM"
+else
+    VLLM_VERSION="$("$CONDA_ENV/bin/python" - <<'PY'
+from importlib.metadata import version
+
+print(version("vllm"))
+PY
+    )"
+    BACKEND_SIGNATURE="$SERVER_BACKEND@$VLLM_VERSION;family=$MODEL_FAMILY;revision=$MODEL_REVISION;tp=$TENSOR_PARALLEL_SIZE;dtype=bfloat16;max-model-len=$MAX_MODEL_LEN;mm-images=$LIMIT_MM_IMAGES;interleave-mm=$INTERLEAVE_MM_STRINGS;chat-template=${CHAT_TEMPLATE:-none}"
 fi
 
 if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
@@ -170,6 +402,54 @@ if [[ "$BENCHMARK" == "mmiu" && "${PREPARE_MMIU:-0}" == "1" ]]; then
     fi
 fi
 
+if [[ "$BENCHMARK" == "crossvid" && "${PREPARE_CROSSVID:-0}" == "1" ]]; then
+    CROSSVID_DATASET_REVISION="4cc98eee034e6f3950c19803485402661f54c1f8"
+    CROSSVID_ROOT="${CROSSVID_ROOT:-$PROJECT_DIR/data/CrossVid}"
+    CROSSVID_MARKER="$CROSSVID_ROOT/.prepared-$CROSSVID_DATASET_REVISION"
+    mkdir -p "$CROSSVID_ROOT"
+
+    # crossvid_eval.py imports the official media preprocessors, so the pinned
+    # upstream checkout is a hard requirement rather than a provenance copy.
+    if [[ ! -d "$CROSSVID_VENDOR_ROOT/.git" ]]; then
+        if [[ -e "$CROSSVID_VENDOR_ROOT" ]]; then
+            printf '%s\n' \
+                "CROSSVID_VENDOR_ROOT=$CROSSVID_VENDOR_ROOT exists but is not a" \
+                'git checkout. Remove it or point CROSSVID_VENDOR_ROOT elsewhere.' >&2
+            exit 2
+        fi
+        printf 'Cloning CrossVid into %s\n' "$CROSSVID_VENDOR_ROOT"
+        git clone "$CROSSVID_REPOSITORY" "$CROSSVID_VENDOR_ROOT"
+    fi
+    if [[ "$(git -C "$CROSSVID_VENDOR_ROOT" rev-parse HEAD)" != "$CROSSVID_COMMIT" ]]; then
+        printf 'Checking out CrossVid %s\n' "$CROSSVID_COMMIT"
+        git -C "$CROSSVID_VENDOR_ROOT" fetch --quiet origin "$CROSSVID_COMMIT" || \
+            git -C "$CROSSVID_VENDOR_ROOT" fetch --quiet origin
+        git -C "$CROSSVID_VENDOR_ROOT" checkout --quiet "$CROSSVID_COMMIT"
+    fi
+
+    if [[ ! -f "$CROSSVID_MARKER" || ! -d "$CROSSVID_ROOT/QA" ]]; then
+        printf '%s\n' \
+            "Downloading CrossVid $CROSSVID_DATASET_REVISION into $CROSSVID_ROOT." \
+            'The pinned release is about 312 GB. The download resumes if interrupted.'
+        "$UV_BIN" run --no-sync hf download Chuntianli/CrossVid \
+            --repo-type dataset \
+            --revision "$CROSSVID_DATASET_REVISION" \
+            --local-dir "$CROSSVID_ROOT"
+    else
+        printf 'Using prepared CrossVid data in %s\n' "$CROSSVID_ROOT"
+    fi
+
+    prepare_crossvid_arguments=(
+        --root "$CROSSVID_ROOT"
+        --marker "$CROSSVID_MARKER"
+    )
+    if [[ "${CROSSVID_ALLOW_MISSING_BEHAVIOR:-0}" == "1" ]]; then
+        prepare_crossvid_arguments+=(--allow-missing-behavior)
+    fi
+    "$UV_BIN" run --no-sync python scripts/prepare_crossvid.py \
+        "${prepare_crossvid_arguments[@]}"
+fi
+
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT_DIR/results}"
 MODEL_TAG="${MODEL//\//_}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${SLURM_JOB_ID:-$$}}"
@@ -193,11 +473,15 @@ trap 'exit 143' TERM INT
 
 printf '%s\n' '--- vLLM startup configuration ---'
 printf 'Model: %s\n' "$MODEL"
+printf 'Model family: %s\n' "$MODEL_FAMILY"
+printf 'Model revision: %s\n' "$MODEL_REVISION"
+printf 'Server backend: %s\n' "$SERVER_BACKEND"
 printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
 printf 'Detected GPU count: %s (from %s)\n' "$detected_gpu_count" "$gpu_detection_source"
 printf 'PyTorch-visible GPU count: %s\n' "$runtime_gpu_count"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
 printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
+printf 'Multimodal image limit: %s\n' "$LIMIT_MM_IMAGES"
 printf 'GPU memory utilization: %s\n' "$GPU_MEMORY_UTILIZATION"
 printf 'Inference timeout: %s seconds\n' "$REQUEST_TIMEOUT"
 printf 'vLLM engine iteration timeout: %s seconds\n' \
@@ -212,17 +496,212 @@ else
 fi
 printf '%s\n' '----------------------------------'
 
+# A site-loaded CUDA module (via MODULES=...) prepends its own lib directory
+# onto LD_LIBRARY_PATH, which can shadow the venv's own pip-installed
+# nvidia-nccl/cudnn/etc. wheels: modern manylinux torch wheels link them with
+# DT_RUNPATH rather than DT_RPATH, and DT_RUNPATH is searched after
+# LD_LIBRARY_PATH. An older module-provided libnccl.so can then load in place
+# of the newer one torch was built against, failing with errors such as
+# "undefined symbol: ncclCommWindowDeregister". Put the venv's own CUDA
+# library directories first so pip-installed wheels always win.
+venv_cuda_lib_dirs="$("$CONDA_PYTHON" - <<'PY'
+import pathlib
+import sysconfig
+
+site_packages = pathlib.Path(sysconfig.get_path("purelib"))
+nvidia_root = site_packages / "nvidia"
+if nvidia_root.is_dir():
+    for lib_dir in sorted(nvidia_root.glob("*/lib")):
+        if lib_dir.is_dir():
+            print(lib_dir)
+PY
+)"
+if [[ -n "$venv_cuda_lib_dirs" ]]; then
+    venv_cuda_lib_path="$(printf '%s' "$venv_cuda_lib_dirs" | paste -sd: -)"
+    export LD_LIBRARY_PATH="$venv_cuda_lib_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    printf 'Prepending venv CUDA libraries to LD_LIBRARY_PATH:\n%s\n' "$venv_cuda_lib_dirs"
+fi
+
+# Confirm torch actually imports in this exact environment before waiting on
+# the full server startup timeout. If it fails, report which CUDA/NCCL
+# libraries the process actually mapped: LD_LIBRARY_PATH only affects the
+# dynamic linker's own search, so it has no effect if something else (a
+# baked-in RPATH, or an earlier explicit preload) already resolved a
+# different, incompatible copy before LD_LIBRARY_PATH would ever be consulted.
+check_torch_imports() {
+    "$CONDA_PYTHON" - <<'PY'
+import sys
+try:
+    import torch
+    print(f"torch {torch.__version__} imported OK from {torch.__file__}")
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        with open(f"/proc/{__import__('os').getpid()}/maps") as handle:
+            mapped = sorted({
+                line.split()[-1]
+                for line in handle
+                if line.strip().endswith(".so") or ".so." in line
+            })
+        relevant = [path for path in mapped if "nccl" in path.lower() or "cuda" in path.lower()]
+        if relevant:
+            print("CUDA/NCCL libraries actually mapped into this process:", file=sys.stderr)
+            for path in relevant:
+                print(f"  {path}", file=sys.stderr)
+        else:
+            print("No CUDA/NCCL libraries were mapped before the failure.", file=sys.stderr)
+    except OSError as maps_exc:
+        print(f"Could not read /proc/self/maps: {maps_exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+if ! check_torch_imports; then
+    printf '\n%s\n' \
+        'torch failed to import. A prior sync against a different lockfile can' \
+        'leave one "nvidia-*" CUDA/NCCL package on disk while another shares its' \
+        'install path (see README.md, "Only include a cuda module..."); attempting' \
+        'a one-time clean reinstall of every locked package to repair it.' >&2
+    sync_environment --reinstall
+    if ! check_torch_imports; then
+        printf '\n%s\n' 'ERROR: torch still failed to import after a clean reinstall.' >&2
+        printf '%s\n' 'This is unrelated to server arguments; see the library paths reported' \
+            'above. If a library outside the venv is listed, it is winning over' \
+            "LD_LIBRARY_PATH via a baked-in RPATH or an earlier preload; remove or" \
+            "reorder that library's source (a site module, a stray system path, or a" \
+            'stale install) rather than the launcher arguments. If every listed' \
+            'library is inside the venv, remove CONDA_ENV entirely and let' \
+            'BOOTSTRAP_CONDA recreate it from a clean prefix:' \
+            "  rm -rf $CONDA_ENV" >&2
+        exit 1
+    fi
+    printf '%s\n' 'Reinstall repaired the environment; continuing.'
+fi
+
 vllm_command=(
     "$UV_BIN" run --no-sync vllm serve "$MODEL"
     --host 127.0.0.1
     --port "$PORT"
+    --revision "$MODEL_REVISION"
     --dtype bfloat16
     --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
     --max-model-len "$MAX_MODEL_LEN"
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-    --limit-mm-per-prompt '{"image":128}'
-    --compilation-config.pass_config.fuse_allreduce_rms false
+    --limit-mm-per-prompt "{\"image\":$LIMIT_MM_IMAGES}"
 )
+
+if [[ "$INTERLEAVE_MM_STRINGS" == "1" ]]; then
+    vllm_command+=(--interleave-mm-strings)
+fi
+if [[ -n "$CHAT_TEMPLATE" ]]; then
+    vllm_command+=(--chat-template "$CHAT_TEMPLATE")
+fi
+if [[ -n "$MM_PROCESSOR_KWARGS" ]]; then
+    vllm_command+=(--mm-processor-kwargs "$MM_PROCESSOR_KWARGS")
+    BACKEND_SIGNATURE+=";mm-processor=$MM_PROCESSOR_KWARGS"
+fi
+
+if [[ "$SERVER_BACKEND" == "vllm-pr38888-image-pruning" ]]; then
+    vllm_command+=(
+        --image-pruning-rate "$IMAGE_PRUNING_RATE"
+        --vit-attention-score-layer-index "$VIT_ATTENTION_SCORE_LAYER_INDEX"
+        --mm-encoder-attn-backend FLASH_ATTN
+        --no-enable-chunked-prefill
+    )
+
+    printf '%s\n' \
+        'WARNING: using an unmerged experimental vLLM PR for image-token pruning.' \
+        "Image pruning rate: $IMAGE_PRUNING_RATE" \
+        "ViT attention layer: $VIT_ATTENTION_SCORE_LAYER_INDEX" \
+        "vLLM source commit: $IMAGE_PRUNING_VLLM_COMMIT"
+
+    "$CONDA_ENV/bin/python" - \
+        "$RUN_DIR/server-config.json" \
+        "$SERVER_BACKEND" \
+        "$IMAGE_PRUNING_VLLM_REPOSITORY" \
+        "$IMAGE_PRUNING_VLLM_COMMIT" \
+        "$IMAGE_PRUNING_VLLM_BASE_COMMIT" \
+        "$IMAGE_PRUNING_WHEEL_VARIANT" \
+        "$VLLM_VERSION" \
+        "$IMAGE_PRUNING_RATE" \
+        "$VIT_ATTENTION_SCORE_LAYER_INDEX" \
+        "$MODEL" \
+        "$ENCODER_PATCH" \
+        "$GLIBC_SHIM" \
+        "${vllm_command[@]:4}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = {
+    "server_backend": sys.argv[2],
+    "source_repository": sys.argv[3],
+    "source_commit": sys.argv[4],
+    "precompiled_wheel_commit": sys.argv[5],
+    "precompiled_wheel_variant": sys.argv[6],
+    "vllm_version": sys.argv[7],
+    "image_pruning_rate": sys.argv[8],
+    "vit_attention_score_layer_index": sys.argv[9],
+    "mm_encoder_attention_backend": "FLASH_ATTN",
+    "model": sys.argv[10],
+    "tensor_parallel_size": 1,
+    "encoder_patch": sys.argv[11],
+    "glibc_shim": sys.argv[12],
+    "server_arguments": sys.argv[13:],
+}
+if path.exists():
+    actual = json.loads(path.read_text(encoding="utf-8"))
+    if actual != expected:
+        raise SystemExit(f"Run configuration does not match {path}")
+else:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+PY
+else
+    "$CONDA_ENV/bin/python" - \
+        "$RUN_DIR/server-config.json" \
+        "$SERVER_BACKEND" \
+        "$VLLM_VERSION" \
+        "$MODEL" \
+        "$MODEL_FAMILY" \
+        "$MODEL_REVISION" \
+        "$TENSOR_PARALLEL_SIZE" \
+        "$MAX_MODEL_LEN" \
+        "$GPU_MEMORY_UTILIZATION" \
+        "$LIMIT_MM_IMAGES" \
+        "${vllm_command[@]:4}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = {
+    "server_backend": sys.argv[2],
+    "vllm_version": sys.argv[3],
+    "model": sys.argv[4],
+    "model_family": sys.argv[5],
+    "model_revision": sys.argv[6],
+    "tensor_parallel_size": int(sys.argv[7]),
+    "dtype": "bfloat16",
+    "max_model_len": int(sys.argv[8]),
+    "gpu_memory_utilization": sys.argv[9],
+    "limit_mm_images": int(sys.argv[10]),
+    "server_arguments": sys.argv[11:],
+}
+if path.exists():
+    actual = json.loads(path.read_text(encoding="utf-8"))
+    if actual != expected:
+        raise SystemExit(f"Run configuration does not match {path}")
+else:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+PY
+fi
 
 printf 'Starting vLLM and waiting up to %s seconds for readiness.\n' "$SERVER_START_TIMEOUT"
 if [[ "$STREAM_SERVER_LOGS" == "1" ]]; then
@@ -294,10 +773,15 @@ case "$BENCHMARK" in
             --dataset-path "$MMIU_ROOT/all.parquet"
             --output "$RUN_DIR/results.jsonl"
             --workers "$WORKERS"
-            --timeout "$REQUEST_TIMEOUT"
+            --model-family "$MODEL_FAMILY"
+            --max-model-len "$MAX_MODEL_LEN"
+            --backend-signature "$BACKEND_SIGNATURE"
         )
         if [[ -n "${MMIU_LIMIT:-}" ]]; then
             mmiu_arguments+=(--limit "$MMIU_LIMIT")
+        fi
+        if [[ "${MMIU_SKIP_OVERSIZED:-0}" == "1" ]]; then
+            mmiu_arguments+=(--skip-oversized-rows)
         fi
         "$UV_BIN" run --no-sync mmiu-eval run "${mmiu_arguments[@]}"
         ;;
@@ -312,11 +796,13 @@ case "$BENCHMARK" in
             --qa-dir "$CROSSVID_ROOT/QA" \
             --video-root "$CROSSVID_ROOT/videos" \
             --uav-root "$CROSSVID_ROOT/uav" \
+            --vendor-root "$CROSSVID_VENDOR_ROOT" \
             --results-dir "$RUN_DIR" \
             --workers "$WORKERS" \
-            --timeout "$REQUEST_TIMEOUT" \
-            --frames "${FRAMES:-128}" \
-            --length "${FRAME_LENGTH:-360}"
+            --frames "$CROSSVID_FRAMES" \
+            --length "${FRAME_LENGTH:-360}" \
+            --model-family "$MODEL_FAMILY" \
+            --backend-signature "$BACKEND_SIGNATURE"
 
         if [[ "$CROSSVID_TASK" == "all" && -n "${JUDGE_MODEL:-}" ]]; then
             "$UV_BIN" run --no-sync crossvid-eval judge \

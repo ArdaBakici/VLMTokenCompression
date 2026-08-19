@@ -1,0 +1,28 @@
+# Requirements for hiprune-qwen / visionzip-qwen: each method's own released
+# Qwen2.5-VL fork (Qwen2_5_VL/qwen2_5_vl_HiPrune.py,
+# Qwen2_5_VL/qwen2_5vl_visionzip.py), run against Qwen/Qwen2.5-VL-7B-Instruct.
+#
+# These forks are standalone copies of transformers' own
+# modeling_qwen2_5_vl.py (regenerated from HuggingFace's
+# modular_qwen2_5_vl.py), so unlike the LLaVA-1.5 methods in
+# requirements.txt, this environment tracks a normal, current transformers
+# release instead of a version pinned years behind for LLaVA-1.5
+# compatibility. HiPrune's fork specifically uses newer APIs
+# (flash_attn_supports_top_left_mask, dynamic_rope_update) that require
+# transformers >= 4.51.
+#
+# vlm-token-compression-eval itself is installed with --no-deps in this env
+# (see requirements.txt for why), so mmiu_eval.py's own runtime dependencies
+# -- the OpenAI client and the MMIU dataset loader -- are listed explicitly
+# here too.
+accelerate>=1.0
+datasets>=2.20,<5
+openai>=1.40,<3
+pillow>=10,<12
+protobuf>=4,<6
+sentencepiece==0.2.0
+shortuuid==1.0.13
+tokenizers>=0.21,<0.22
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.51.3

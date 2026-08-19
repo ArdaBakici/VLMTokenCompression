@@ -1,5 +1,6 @@
 datasets<5,>=2.20
 openai<3,>=1.40
+pillow<13,>=10
 
 [crossvid]
 decord>=0.6
@@ -7,5 +8,8 @@ numpy>=1.26
 opencv-python>=4.10
 tqdm>=4.66
 
+[image-pruning]
+vllm
+
 [serve]
-vllm<1,>=0.11
+vllm==0.25.1

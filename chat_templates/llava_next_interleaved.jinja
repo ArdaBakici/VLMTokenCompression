@@ -1,0 +1,5 @@
+{{ bos_token }}{% for message in messages %}
+{% if message['role'] == 'user' %}{{ '[INST] ' }}{% for item in message['content'] %}{% if item['type'] == 'image' %}{{ '<image>\n' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}{% endfor %}{{ ' [/INST]' }}
+{% elif message['role'] == 'assistant' %}{{ ' ' }}{% for item in message['content'] %}{% if item['type'] == 'text' %}{{ item['text'] }}{% endif %}{% endfor %}{{ eos_token }}
+{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}
+{% endfor %}

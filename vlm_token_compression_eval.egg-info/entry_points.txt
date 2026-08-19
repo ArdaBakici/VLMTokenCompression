@@ -1,4 +1,5 @@
 [console_scripts]
 crossvid-eval = crossvid_eval:main
 crossvid-score = crossvid_score:main
+efficiency-compare = efficiency_metrics:main
 mmiu-eval = mmiu_eval:main

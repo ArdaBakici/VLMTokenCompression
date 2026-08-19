@@ -1,7 +1,11 @@
 README.md
+compression_profiles.py
 crossvid_eval.py
 crossvid_score.py
+efficiency_metrics.py
 mmiu_eval.py
+model_profiles.py
+official_compression_server.py
 pyproject.toml
 vlm_token_compression_eval.egg-info/PKG-INFO
 vlm_token_compression_eval.egg-info/SOURCES.txt

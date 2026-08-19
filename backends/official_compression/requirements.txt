@@ -1,0 +1,29 @@
+accelerate==0.21.0
+bitsandbytes==0.41.1
+# vlm-token-compression-eval itself is installed with --no-deps in this env
+# (its normal dependencies would upgrade torch/transformers/numpy out from
+# under the pinned CDPruner/HiPrune/DivPrune/VisionZip stack), so mmiu_eval.py's
+# own runtime dependencies -- the OpenAI client and the MMIU dataset loader --
+# must be listed explicitly here too.
+datasets>=2.20,<5
+einops==0.6.1
+einops-exts==0.0.4
+numpy<2
+openai>=1.40,<3
+peft==0.4.0
+pillow>=10,<12
+protobuf>=4,<6
+sentencepiece==0.1.99
+shortuuid==1.0.13
+# transformers -> accelerate -> bitsandbytes.functional imports scipy.stats
+# unconditionally at module load, even though none of these methods use
+# bitsandbytes quantization. bitsandbytes==0.41.1 does not declare it as a
+# dependency, so it must be pinned explicitly here. 1.11.4 is the last scipy
+# release before the numpy<2 floor started shifting and matches this
+# requirements file's era (numpy<2, python 3.10).
+scipy==1.11.4
+timm==0.6.13
+tokenizers==0.15.1
+torch==2.1.2
+torchvision==0.16.2
+transformers==4.37.2
