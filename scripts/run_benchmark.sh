@@ -13,6 +13,8 @@ WORKERS="${WORKERS:-4}"
 SYNC_ENV="${SYNC_ENV:-1}"
 BOOTSTRAP_CONDA="${BOOTSTRAP_CONDA:-1}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-1800}"
+VLLM_ENGINE_ITERATION_TIMEOUT_S="${VLLM_ENGINE_ITERATION_TIMEOUT_S:-900}"
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-$VLLM_ENGINE_ITERATION_TIMEOUT_S}"
 SERVER_LOG_LINES="${SERVER_LOG_LINES:-200}"
 STREAM_SERVER_LOGS="${STREAM_SERVER_LOGS:-1}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
@@ -187,6 +189,8 @@ export HF_HOME="${HF_HOME:-${SCRATCH:-$HOME/.cache}/huggingface}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-${SCRATCH:-$HOME/.cache}/conda-pkgs}"
 export OPENAI_API_KEY
 export TOKENIZERS_PARALLELISM=false
+# Some multimodal shapes trigger Triton compilation during their first request.
+export VLLM_ENGINE_ITERATION_TIMEOUT_S
 
 if ! command -v conda >/dev/null 2>&1; then
     printf '%s\n' \
@@ -473,14 +477,19 @@ printf 'Model family: %s\n' "$MODEL_FAMILY"
 printf 'Model revision: %s\n' "$MODEL_REVISION"
 printf 'Server backend: %s\n' "$SERVER_BACKEND"
 printf 'Tensor parallel size: %s\n' "$TENSOR_PARALLEL_SIZE"
+printf 'Detected GPU count: %s (from %s)\n' "$detected_gpu_count" "$gpu_detection_source"
+printf 'PyTorch-visible GPU count: %s\n' "$runtime_gpu_count"
 printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES:-<not set>}"
 printf 'Maximum model length: %s\n' "$MAX_MODEL_LEN"
 printf 'Multimodal image limit: %s\n' "$LIMIT_MM_IMAGES"
 printf 'GPU memory utilization: %s\n' "$GPU_MEMORY_UTILIZATION"
+printf 'Inference timeout: %s seconds\n' "$REQUEST_TIMEOUT"
+printf 'vLLM engine iteration timeout: %s seconds\n' \
+    "$VLLM_ENGINE_ITERATION_TIMEOUT_S"
 printf 'Conda environment: %s\n' "$CONDA_ENV"
 printf 'Server log: %s\n' "$SERVER_LOG"
 if command -v nvidia-smi >/dev/null 2>&1; then
-    printf '%s\n' 'Visible GPUs:'
+    printf '%s\n' 'nvidia-smi GPU inventory (may ignore CUDA_VISIBLE_DEVICES):'
     nvidia-smi --list-gpus || true
 else
     printf '%s\n' 'Warning: nvidia-smi is not available.'
@@ -802,7 +811,8 @@ case "$BENCHMARK" in
                 --api-key "${JUDGE_API_KEY:-$OPENAI_API_KEY}" \
                 --qa-dir "$CROSSVID_ROOT/QA" \
                 --results-dir "$RUN_DIR" \
-                --workers "${JUDGE_WORKERS:-$WORKERS}"
+                --workers "${JUDGE_WORKERS:-$WORKERS}" \
+                --timeout "$REQUEST_TIMEOUT"
             "$UV_BIN" run --no-sync crossvid-score score \
                 --qa-dir "$CROSSVID_ROOT/QA" \
                 --results-dir "$RUN_DIR" \

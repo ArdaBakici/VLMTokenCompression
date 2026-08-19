@@ -974,7 +974,10 @@ vLLM startup output is streamed to the terminal and saved under the run result
 directory. If startup fails, the launcher prints the last 200 log lines. Set
 `STREAM_SERVER_LOGS=0` to keep startup output only in the file,
 `SERVER_LOG_LINES` to change the failure excerpt, or `SERVER_START_TIMEOUT` to
-change the readiness timeout in seconds.
+change the readiness timeout in seconds. Some image shapes trigger Triton JIT
+compilation when first encountered during inference. The launcher allows 900
+seconds for these requests by default; override `REQUEST_TIMEOUT` and
+`VLLM_ENGINE_ITERATION_TIMEOUT_S` if needed.
 
 MMIU on one visible GPU:
 
@@ -991,6 +994,12 @@ CROSSVID_ROOT=/datasets/CrossVid \
 TENSOR_PARALLEL_SIZE=4 \
   scripts/run_benchmark.sh crossvid Qwen/Qwen3-VL-32B-Instruct
 ```
+
+The launcher automatically derives tensor parallelism from
+`SLURM_GPUS_ON_NODE` or `CUDA_VISIBLE_DEVICES`. An explicit
+`TENSOR_PARALLEL_SIZE` overrides detection. Before launching vLLM it checks
+`torch.cuda.device_count()` and stops with allocation diagnostics if fewer GPUs
+are actually visible than requested.
 
 The first invocation creates the Conda prefix, installs uv from conda-forge,
 and synchronizes the locked dependencies. Set `SYNC_ENV=0,BOOTSTRAP_CONDA=0` on
